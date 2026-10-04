@@ -1,0 +1,241 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://novaos.ai/schemas/agent-manifest-v2.json",
+  "title": "NovaOS Agent Manifest v2",
+  "description": "Agent manifest schema v2. Backward compatible with v1 — all new fields are optional.",
+  "type": "object",
+  "required": ["name", "protocol", "publisher", "base_image"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1.0", "2.0"],
+      "default": "2.0",
+      "description": "Manifest schema version. v1 manifests are auto-upgraded."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$",
+      "description": "K8s DNS-compatible name, max 63 chars."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+",
+      "description": "SemVer version string."
+    },
+    "protocol": {
+      "type": "string",
+      "enum": ["A2A", "ACP", "REST"],
+      "description": "Adapter selector, not a wire protocol. \"A2A\" is the canonical name for the SDK adapter; \"ACP\" is a deprecated legacy alias, still accepted for existing manifests."
+    },
+    "publisher": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$",
+      "description": "Publisher identity — DNS-compatible slug (NEW in v2, required for marketplace registration)."
+    },
+    "base_image": {
+      "type": "string",
+      "pattern": "^novaos/base-(langgraph|crewai|plain):[0-9]+\\.[0-9]+$",
+      "description": "Base container image for deployment (NEW in v2). Must use an official novaos base image."
+    },
+    "models": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Model IDs the agent must have available."
+        },
+        "optional": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Model IDs the agent can use if available."
+        }
+      },
+      "description": "Model requirements (NEW in v2)."
+    },
+    "language": {
+      "type": "string",
+      "enum": ["python", "java", "typescript"],
+      "description": "Primary implementation language (NEW in v2)."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "author": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" }
+      },
+      "description": "Agent author (NEW in v2, required for marketplace publishing)."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Searchable tags."
+    },
+    "domains": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Business domains (e.g. compliance, finance)."
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Agent service URL (v1 field, still supported)."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "v1 metadata block (deprecated in v2 — use top-level fields instead).",
+      "properties": {
+        "capabilities": { "type": "array" },
+        "domains": { "type": "array" },
+        "tags": { "type": "array" },
+        "author": { "type": "object" }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "description": "Declared permissions (NEW in v2). Replaces implicit capabilities.",
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "memory",
+              "knowledge",
+              "llm",
+              "hitl",
+              "files",
+              "notify",
+              "http",
+              "browser",
+              "code",
+              "agents",
+              "connectors"
+            ]
+          }
+        },
+        "network_egress": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowlist of external domains the agent may call."
+        },
+        "max_memory_mb": { "type": "integer", "minimum": 64, "maximum": 8192 },
+        "max_cpu_millicores": { "type": "integer", "minimum": 100, "maximum": 4000 },
+        "max_timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000 }
+      }
+    },
+    "requiredSecrets": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Secret keys the agent requires at runtime."
+    },
+    "requiredConfig": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Config keys the agent requires at runtime."
+    },
+    "skills": {
+      "type": "array",
+      "description": "Typed skill declarations (NEW in v2).",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "input_schema": { "type": "object" },
+          "output_schema": { "type": "object" }
+        }
+      }
+    },
+    "agent_module": {
+      "type": "string",
+      "description": "MODULE:ATTR naming the AgentBuilder instance `novaos-cli publish` runs the SDK's Agent Card emitter against. Defaults to \"server:agent\", matching the Python scaffold template."
+    },
+    "shadow": {
+      "type": "object",
+      "description": "Shadow testing configuration (NEW in v2).",
+      "properties": {
+        "evaluation": {
+          "type": "object",
+          "properties": {
+            "correctness_mode": {
+              "type": "string",
+              "enum": ["exact_match", "semantic_similarity", "llm_judge"],
+              "default": "semantic_similarity"
+            },
+            "correctness_threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.85
+            },
+            "latency_threshold_p95_ms": { "type": "integer", "default": 5000 },
+            "cost_increase_threshold_pct": { "type": "integer", "default": 20 },
+            "min_sample_size": { "type": "integer", "minimum": 10, "default": 100 }
+          }
+        }
+      }
+    },
+    "deployment_target": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["chat", "api"]
+      },
+      "minItems": 1,
+      "default": ["chat"],
+      "description": "Intended consumption contexts. 'chat' = visible in marketplace and installable by users. 'api' = API-only, provisioned by admins for service accounts. Defaults to ['chat'] if omitted."
+    },
+    "release_channel": {
+      "type": "string",
+      "enum": ["stable", "beta", "canary"],
+      "default": "stable",
+      "description": "Release channel for this version. Controls which user installations receive it. stable = all users, beta = opted-in users, canary = explicit testers only."
+    },
+    "dependencies": {
+      "type": "object",
+      "description": "Locked dependency versions for this agent version. Pinned at publish time.",
+      "properties": {
+        "skills": {
+          "type": "object",
+          "description": "Skill package versions required by this agent.",
+          "additionalProperties": { "type": "string" }
+        },
+        "mcp_servers": {
+          "type": "object",
+          "description": "MCP server versions required by this agent.",
+          "additionalProperties": { "type": "string" }
+        },
+        "llm_model": {
+          "type": "string",
+          "description": "Pinned LLM model alias (e.g. 'gpt-4o-2024-11-20'). If absent, the platform default is used."
+        }
+      },
+      "additionalProperties": false
+    },
+    "rollback_policy": {
+      "type": "object",
+      "description": "Automatic rollback configuration. If enabled, the platform rolls back this version if post-promote evaluation drops below the threshold.",
+      "properties": {
+        "auto_rollback_on_eval_drop": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, the platform will automatically rollback this version if post-promote eval score drops below eval_threshold."
+        },
+        "eval_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8,
+          "description": "Minimum aggregate evaluation score required to keep this version in production after promotion."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

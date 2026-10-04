@@ -1,0 +1,38 @@
+{
+  "name": "novaos-cli",
+  "version": "0.0.0",
+  "description": "NovaOS CLI: build, run and publish agents, MCP servers and connectors for NovaOS",
+  "license": "MIT",
+  "author": "NovaOS Team",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OrbitronAI-Repo/novaos-cli.git"
+  },
+  "homepage": "https://github.com/OrbitronAI-Repo/novaos-cli#readme",
+  "bugs": {
+    "url": "https://github.com/OrbitronAI-Repo/novaos-cli/issues"
+  },
+  "keywords": [
+    "novaos",
+    "cli",
+    "agents",
+    "a2a"
+  ],
+  "bin": {
+    "novaos-cli": "bin/novaos-cli.js"
+  },
+  "files": [
+    "bin/novaos-cli.js",
+    "install.js"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

@@ -1,0 +1,4 @@
+# Downloaded by install.js; never committed or packed.
+bin/novaos-cli-bin
+*.tgz
+node_modules/

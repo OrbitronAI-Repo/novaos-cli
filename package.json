@@ -1,0 +1,8 @@
+{
+  "name": "novaos-cli-workspace",
+  "private": true,
+  "workspaces": [
+    "galaxy-cli",
+    "shared"
+  ]
+}

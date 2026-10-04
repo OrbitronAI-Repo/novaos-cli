@@ -1,0 +1,706 @@
+name: Release
+
+# Builds novaos-cli's standalone binaries and publishes them as a GitHub
+# Release whenever a version tag is pushed. Tags containing "-rc" publish
+# as a prerelease. Release notes are the matching section of
+# galaxy-cli/CHANGELOG.md.
+#
+# A Windows binary is built, but it is only signed and published, together
+# with a generated winget manifest, when the WINDOWS_CODE_SIGN_CERT_BASE64
+# and WINDOWS_CODE_SIGN_CERT_PASSWORD secrets are both configured: an
+# unsigned .exe triggers SmartScreen/Defender warnings and must not ship
+# through this public channel. Without those secrets, the build step drops
+# the unsigned binary, the manifest step skips itself, and this workflow
+# publishes only the macOS and Linux binaries.
+#
+# The npm package (galaxy-cli/npm-wrapper) is a thin wrapper whose
+# postinstall downloads the binary from the GitHub Release this workflow
+# just published, so it is always packed and smoke-tested against that
+# release first. The npm-publish job then publishes that exact tarball with
+# npm trusted publishing (OIDC, no token secret) and a provenance
+# attestation, and npm-registry-smoke checks what the registry serves. Both
+# jobs run only from a public repository and only when the repository
+# variable NPM_PUBLISH_ENABLED is 'true'; otherwise they are skipped and the
+# release job prints a notice saying why. npm-publish is safe to re-run: a
+# version already on the registry with the same tarball integrity counts as
+# published.
+#
+# The macOS binaries are cross-compiled on Linux, which leaves their embedded
+# code signature invalid: `bun build --compile` appends the bundled program
+# after the runtime's existing signature. Current macOS releases kill a
+# binary whose signature does not verify as soon as it starts. The
+# sign-macos job re-signs both macOS binaries ad hoc, and the verify-macos
+# jobs check the signature and run each binary on its own architecture.
+# Nothing is published unless both pass, and checksums.txt is computed from
+# the re-signed files.
+#
+#   build -> sign-macos -> verify-macos (arm64, x64) -> release
+#     -> npm-publish -> npm-registry-smoke (ubuntu, macOS)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.5"
+
+      - name: Install dependencies
+        # The checked-in bun.lock pins every dependency; a stale lockfile fails here.
+        run: bun install --frozen-lockfile
+
+      - name: Set package version from tag
+        # CLI_VERSION is a static bake of package.json's version at compile
+        # time (see src/cli.ts), decoupled from the monorepo's own
+        # versioning — so the release tag, not whatever version.json
+        # happens to carry over from the export, is the source of truth
+        # for what a built binary reports.
+        working-directory: galaxy-cli
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          jq --arg v "$version" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+      - name: Build standalone binaries
+        working-directory: galaxy-cli
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          declare -A TARGETS=(
+            [bun-darwin-arm64]=novaos-cli-darwin-arm64
+            [bun-darwin-x64]=novaos-cli-darwin-x64
+            [bun-linux-x64]=novaos-cli-linux-x64
+            [bun-linux-arm64]=novaos-cli-linux-arm64
+            [bun-windows-x64]=novaos-cli-windows-x64.exe
+          )
+          for target in "${!TARGETS[@]}"; do
+            outfile="dist/${TARGETS[$target]}"
+            echo "Building $target -> $outfile"
+            bun build --compile --target="$target" src/cli.ts --outfile "$outfile"
+          done
+
+      - name: Sign Windows binary (or drop it if unsigned)
+        working-directory: galaxy-cli
+        env:
+          WINDOWS_CODE_SIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODE_SIGN_CERT_BASE64 }}
+          WINDOWS_CODE_SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGN_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          exe="dist/novaos-cli-windows-x64.exe"
+          if [[ -z "${WINDOWS_CODE_SIGN_CERT_BASE64:-}" || -z "${WINDOWS_CODE_SIGN_CERT_PASSWORD:-}" ]]; then
+            echo "::warning::No Windows code-signing certificate configured (WINDOWS_CODE_SIGN_CERT_BASE64/WINDOWS_CODE_SIGN_CERT_PASSWORD secrets unset) — dropping the unsigned $exe instead of publishing it."
+            rm -f "$exe"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osslsigncode
+          cert_path="$(mktemp)"
+          echo "$WINDOWS_CODE_SIGN_CERT_BASE64" | base64 -d > "$cert_path"
+          osslsigncode sign \
+            -pkcs12 "$cert_path" \
+            -pass "$WINDOWS_CODE_SIGN_CERT_PASSWORD" \
+            -n "novaos-cli" \
+            -t http://timestamp.digicert.com \
+            -in "$exe" \
+            -out "$exe.signed"
+          mv "$exe.signed" "$exe"
+          rm -f "$cert_path"
+
+      - name: Upload macOS binaries for signing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-binaries-unsigned
+          path: galaxy-cli/dist/novaos-cli-darwin-*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload the other binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: other-binaries
+          path: |
+            galaxy-cli/dist/novaos-cli-*
+            !galaxy-cli/dist/novaos-cli-darwin-*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-macos:
+    name: Sign macOS binaries
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: macos-binaries-unsigned
+          path: dist
+
+      - name: Re-sign ad hoc
+        # Replaces the signature the Linux cross-compile left invalid. An
+        # ad-hoc signature carries no identity, so no certificate is needed;
+        # it is what lets current macOS run the binary at all.
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for bin in novaos-cli-darwin-arm64 novaos-cli-darwin-x64; do
+            codesign --force --sign - --identifier novaos-cli "$bin"
+            codesign -v --strict --verbose=2 "$bin"
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-binaries
+          path: |
+            dist/novaos-cli-darwin-arm64
+            dist/novaos-cli-darwin-x64
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-macos:
+    # The release gate: the exact files that will be published must have a
+    # valid signature and must start on their own architecture.
+    name: Verify macOS binary (${{ matrix.arch }})
+    needs: sign-macos
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: macos-binaries
+          path: dist
+
+      - name: Check the signature and run the binary
+        env:
+          ARCH: ${{ matrix.arch }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          bin="dist/novaos-cli-darwin-$ARCH"
+          expected="${RELEASE_TAG#v}"
+          # Artifacts do not keep the executable bit.
+          chmod +x "$bin"
+          if ! codesign -v --strict --verbose=2 "$bin"; then
+            echo "::error::$bin has an invalid code signature; macOS would refuse to run it."
+            exit 1
+          fi
+          codesign -dv "$bin"
+          status=0
+          reported="$(HOME="$(mktemp -d)" "./$bin" -V)" || status=$?
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::$bin -V exited with status $status."
+            exit 1
+          fi
+          if [[ "$reported" != "$expected" ]]; then
+            echo "::error::$bin reports version '$reported', expected '$expected'."
+            exit 1
+          fi
+          echo "$bin: valid signature, reports $reported."
+
+  release:
+    name: Publish release
+    needs: [build, verify-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      npm-tarball: ${{ steps.npm-pack.outputs.tarball }}
+      npm-version: ${{ steps.npm-pack.outputs.version }}
+      npm-dist-tag: ${{ steps.npm-pack.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: other-binaries
+          path: galaxy-cli/dist
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: macos-binaries
+          path: galaxy-cli/dist
+
+      - name: Checksums
+        working-directory: galaxy-cli/dist
+        run: sha256sum novaos-cli-* > checksums.txt
+
+      - name: Generate winget manifest
+        # Only when the signed Windows binary above wasn't dropped — a
+        # manifest pointing at a binary this release doesn't publish would
+        # be actively misleading.
+        if: hashFiles('galaxy-cli/dist/novaos-cli-windows-x64.exe') != ''
+        working-directory: galaxy-cli
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          sha256="$(grep novaos-cli-windows-x64.exe dist/checksums.txt | cut -d' ' -f1)"
+          installer_url="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG/novaos-cli-windows-x64.exe"
+          id="OrbitronAI.NovaosCli"
+          outdir="$(mktemp -d)"
+
+          cat > "$outdir/$id.yaml" <<YAML
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+          PackageIdentifier: $id
+          PackageVersion: $version
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.6.0
+          YAML
+
+          cat > "$outdir/$id.installer.yaml" <<YAML
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+          PackageIdentifier: $id
+          PackageVersion: $version
+          InstallerType: portable
+          Commands:
+            - novaos-cli
+          Installers:
+            - Architecture: x64
+              InstallerUrl: $installer_url
+              InstallerSha256: $sha256
+          ManifestType: installer
+          ManifestVersion: 1.6.0
+          YAML
+
+          cat > "$outdir/$id.locale.en-US.yaml" <<YAML
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+          PackageIdentifier: $id
+          PackageVersion: $version
+          PackageLocale: en-US
+          Publisher: OrbitronAI
+          PackageName: NovaOS CLI
+          License: MIT
+          ShortDescription: Galaxy CLI - Agent Development Lifecycle tooling for NovaOS
+          ManifestType: defaultLocale
+          ManifestVersion: 1.6.0
+          YAML
+
+          zip_path="$(pwd)/dist/winget-manifests-$RELEASE_TAG.zip"
+          (cd "$outdir" && zip -j "$zip_path" ./*.yaml)
+
+      - name: Extract release notes from the changelog
+        # The notes are the CHANGELOG section for the release's base version,
+        # so a release candidate carries the notes of the release it rehearses.
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          base="${version%%-*}"
+          python3 - "$base" galaxy-cli/CHANGELOG.md "$RUNNER_TEMP/release-notes.md" <<'PYEOF'
+          import re
+          import sys
+
+          base, changelog, out = sys.argv[1:4]
+          lines = open(changelog, encoding="utf-8").read().splitlines()
+          heading = re.compile(r"^## \[" + re.escape(base) + r"\]")
+          start = next((i for i, line in enumerate(lines) if heading.match(line)), None)
+          if start is None:
+              raise SystemExit(f"CHANGELOG.md has no '## [{base}]' section")
+          end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## [")), len(lines))
+          body = "\n".join(lines[start + 1 : end]).strip()
+          if not body:
+              raise SystemExit(f"The '## [{base}]' section of CHANGELOG.md is empty")
+          with open(out, "w", encoding="utf-8") as f:
+              f.write(body + "\n")
+          PYEOF
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=()
+          if [[ "$RELEASE_TAG" == *-rc* ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          gh release view "$RELEASE_TAG" > /dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --verify-tag \
+              "${prerelease_flag[@]}"
+
+      - name: Upload binaries and checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" galaxy-cli/dist/novaos-cli-* galaxy-cli/dist/checksums.txt --clobber
+
+      - name: Upload winget manifest
+        if: hashFiles('galaxy-cli/dist/winget-manifests-*.zip') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release upload "$RELEASE_TAG" galaxy-cli/dist/winget-manifests-*.zip --clobber
+
+      - name: Pack npm wrapper
+        # The npm version is the release tag, nothing else — there is no
+        # separately incrementing npm version. The repository, homepage and
+        # bugs fields are set to the repo this workflow runs in, so the
+        # published package's postinstall downloads from the release just
+        # published above, and the package page links to the right repo,
+        # wherever this workflow lives. A -rc tag goes to the `next`
+        # dist-tag, anything else to `latest`.
+        id: npm-pack
+        working-directory: galaxy-cli/npm-wrapper
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          jq --arg v "$version" --arg repo "$REPOSITORY" \
+            '.version = $v
+             | .repository = { type: "git", url: ("git+https://github.com/" + $repo + ".git") }
+             | .homepage = ("https://github.com/" + $repo + "#readme")
+             | .bugs = { url: ("https://github.com/" + $repo + "/issues") }' \
+            package.json > package.json.tmp
+          mv package.json.tmp package.json
+          tarball="$(npm pack --json | jq -r '.[0].filename')"
+          dist_tag="latest"
+          if [[ "$RELEASE_TAG" == *-rc* ]]; then
+            dist_tag="next"
+          fi
+          {
+            echo "tarball=$tarball"
+            echo "version=$version"
+            echo "dist_tag=$dist_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload npm tarball
+        # The exact tarball the smoke test installs, published so it can be
+        # verified and installed offline.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARBALL: ${{ steps.npm-pack.outputs.tarball }}
+        run: gh release upload "$RELEASE_TAG" "galaxy-cli/npm-wrapper/$TARBALL" --clobber
+
+      - name: Smoke-test npm wrapper against this release
+        # Installs the exact tarball that would be published, from a clean
+        # prefix with no checkout context, and runs the binary it downloads
+        # from the release published above. This is the gate on publishing:
+        # a wrapper that cannot install and run here never reaches npm.
+        working-directory: galaxy-cli/npm-wrapper
+        env:
+          NOVAOS_CLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.npm-pack.outputs.tarball }}
+          VERSION: ${{ steps.npm-pack.outputs.version }}
+        run: |
+          set -euo pipefail
+          prefix="$(mktemp -d)"
+          npm install -g --prefix "$prefix" "./$TARBALL"
+          reported="$("$prefix/bin/novaos-cli" --cli-version)"
+          if [[ "$reported" != "$VERSION" ]]; then
+            echo "::error::npm wrapper installed novaos-cli $reported, expected $VERSION"
+            exit 1
+          fi
+          "$prefix/bin/novaos-cli" --help > /dev/null
+          HOME="$(mktemp -d)" "$prefix/bin/novaos-cli" env list
+
+      - name: Smoke-test the first-run download (install scripts skipped)
+        # pnpm and bun block dependency install scripts by default, as does
+        # npm --ignore-scripts. The launcher then downloads and verifies the
+        # binary itself on first run and says so on stderr.
+        working-directory: galaxy-cli/npm-wrapper
+        env:
+          NOVAOS_CLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.npm-pack.outputs.tarball }}
+          VERSION: ${{ steps.npm-pack.outputs.version }}
+        run: |
+          set -euo pipefail
+          prefix="$(mktemp -d)"
+          npm install -g --ignore-scripts --prefix "$prefix" "./$TARBALL"
+          stderr_file="$(mktemp)"
+          reported="$(HOME="$(mktemp -d)" "$prefix/bin/novaos-cli" --cli-version 2> "$stderr_file")"
+          cat "$stderr_file"
+          if ! grep -q "on first run" "$stderr_file"; then
+            echo "::error::The launcher did not report a first-run download."
+            exit 1
+          fi
+          if [[ "$reported" != "$VERSION" ]]; then
+            echo "::error::The first-run download installed novaos-cli $reported, expected $VERSION"
+            exit 1
+          fi
+
+      - name: Keep the npm tarball for the publish job
+        # npm-publish publishes these exact bytes, the ones smoke-tested above
+        # and attached to the release; it never repacks.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-tarball
+          path: galaxy-cli/npm-wrapper/${{ steps.npm-pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report whether npm publishing runs
+        # Says why npm-publish and npm-registry-smoke run or are skipped, so a
+        # skip is never silent. The npm package is published only from a
+        # public repository: from a private one, its postinstall would point
+        # every npm user at release assets only a token holder can download.
+        env:
+          NPM_PUBLISH_ENABLED: ${{ vars.NPM_PUBLISH_ENABLED }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
+          TARBALL: ${{ steps.npm-pack.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          enabled="${NPM_PUBLISH_ENABLED:-}"
+          if [[ "${REPOSITORY_IS_PRIVATE:-}" != "false" ]]; then
+            message="npm publish skipped: $REPOSITORY is private, and npm packages are published only from a public repository, by design. $TARBALL was packed and smoke-tested above."
+          elif [[ "${enabled,,}" != "true" ]]; then
+            message="npm publish disabled (NPM_PUBLISH_ENABLED is not 'true')"
+          else
+            message="npm publish enabled: the npm-publish job publishes $TARBALL."
+          fi
+          echo "::notice::$message"
+          echo "$message" >> "$GITHUB_STEP_SUMMARY"
+
+  npm-publish:
+    # Trusted publishing: npm exchanges this job's GitHub OIDC token for a
+    # short-lived publish credential, so no npm token exists anywhere, and the
+    # publish carries a provenance attestation. The package's trusted
+    # publisher on npmjs.com names this repository, this workflow file and the
+    # npm-publish environment; a publish from anywhere else is refused.
+    name: Publish to npm
+    needs: release
+    if: github.event.repository.private == false && vars.NPM_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-tarball
+          path: npm-tarball
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.x"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm with trusted publishing support
+        # Trusted publishing needs npm 11.5.1 or later on Node.js 22.14.0 or
+        # later.
+        run: |
+          set -euo pipefail
+          npm install -g npm@^11.5.1
+          npm --version
+
+      - name: Publish to npm (or confirm this version is already published)
+        # Safe to re-run. If the registry already has this version with the
+        # same dist.integrity as this tarball, an earlier attempt published it
+        # and the job succeeds without publishing again. The same version with
+        # a different integrity means a different tarball went out under this
+        # version, which fails the job.
+        working-directory: npm-tarball
+        env:
+          PACKAGE: novaos-cli
+          TARBALL: ${{ needs.release.outputs.npm-tarball }}
+          VERSION: ${{ needs.release.outputs.npm-version }}
+          DIST_TAG: ${{ needs.release.outputs.npm-dist-tag }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          if [[ "${REPOSITORY_IS_PRIVATE:-}" != "false" ]]; then
+            echo "::error::$REPOSITORY is not known to be public (repository.private is '${REPOSITORY_IS_PRIVATE:-}'); refusing to publish to npm."
+            exit 1
+          fi
+          if [[ -z "$TARBALL" || ! -f "$TARBALL" || -z "$VERSION" || -z "$DIST_TAG" ]]; then
+            echo "::error::Missing the release job's npm outputs or tarball (tarball '$TARBALL', version '$VERSION', dist-tag '$DIST_TAG')."
+            exit 1
+          fi
+          tarball_integrity="sha512-$(openssl dgst -sha512 -binary "$TARBALL" | base64 | tr -d '\n')"
+          echo "$TARBALL integrity: $tarball_integrity"
+
+          # Prints the registry's dist.integrity for $PACKAGE@$VERSION, or
+          # nothing when that version is not published. Any registry error
+          # other than "not found" fails the step.
+          registry_integrity() {
+            local out status=0
+            out="$(npm view "$PACKAGE@$VERSION" dist.integrity --json --prefer-online 2> /dev/null)" || status=$?
+            if [[ "$status" -eq 0 ]]; then
+              jq -r 'if type == "string" then . else empty end' <<< "$out"
+              return 0
+            fi
+            if [[ "$(jq -r '.error.code? // empty' <<< "$out" 2> /dev/null || true)" == "E404" ]]; then
+              return 0
+            fi
+            echo "::error::npm view $PACKAGE@$VERSION failed with exit status $status: $out" >&2
+            return 1
+          }
+
+          accept_existing() {
+            if [[ "$1" == "$tarball_integrity" ]]; then
+              echo "$PACKAGE@$VERSION is already on the registry with this tarball's integrity; nothing left to publish."
+              return 0
+            fi
+            echo "::error::$PACKAGE@$VERSION is already on the registry with integrity $1, but this run's tarball has $tarball_integrity. A different tarball was published under this version. Do not re-tag; release a new patch version."
+            return 1
+          }
+
+          existing="$(registry_integrity)"
+          if [[ -n "$existing" ]]; then
+            accept_existing "$existing"
+            exit 0
+          fi
+
+          publish_status=0
+          npm publish "./$TARBALL" --access public --tag "$DIST_TAG" --provenance || publish_status=$?
+          if [[ "$publish_status" -ne 0 ]]; then
+            # A publish can reach the registry and still report a failure, for
+            # example when the response is lost. It counts if the registry now
+            # has this exact tarball.
+            existing="$(registry_integrity)"
+            if [[ -n "$existing" ]]; then
+              accept_existing "$existing"
+              exit 0
+            fi
+            echo "::error::npm publish of $TARBALL failed with exit status $publish_status."
+            exit "$publish_status"
+          fi
+          echo "Published $PACKAGE@$VERSION to dist-tag $DIST_TAG with provenance."
+
+  npm-registry-smoke:
+    # Read-only checks of what the registry serves, so a re-run is always
+    # safe. Installs run without any GitHub token, as a user's would.
+    name: npm registry smoke (${{ matrix.os }})
+    needs: [release, npm-publish]
+    if: github.event.repository.private == false && vars.NPM_PUBLISH_ENABLED == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    env:
+      PACKAGE: novaos-cli
+      VERSION: ${{ needs.release.outputs.npm-version }}
+      DIST_TAG: ${{ needs.release.outputs.npm-dist-tag }}
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.x"
+          package-manager-cache: false
+
+      - name: Wait for the registry to serve the version and dist-tag
+        # A fresh publish takes a few minutes to reach every registry edge.
+        run: |
+          set -euo pipefail
+          served=""
+          tagged=""
+          for attempt in $(seq 1 10); do
+            served="$(npm view "$PACKAGE@$VERSION" version --prefer-online 2> /dev/null || true)"
+            tagged="$(npm view "$PACKAGE" dist-tags --json --prefer-online 2> /dev/null | jq -r --arg tag "$DIST_TAG" '.[$tag] // empty' || true)"
+            if [[ "$served" == "$VERSION" && "$tagged" == "$VERSION" ]]; then
+              echo "The registry serves $PACKAGE@$VERSION, and dist-tag $DIST_TAG points at it."
+              exit 0
+            fi
+            echo "Attempt $attempt/10: version '$served', dist-tag $DIST_TAG '$tagged'; waiting 30s."
+            sleep 30
+          done
+          if [[ "$served" != "$VERSION" ]]; then
+            echo "::error::The registry still does not serve $PACKAGE@$VERSION after 10 attempts."
+          else
+            echo "::error::dist-tag $DIST_TAG points at '$tagged', expected $VERSION."
+          fi
+          npm view "$PACKAGE" dist-tags --json --prefer-online || true
+          exit 1
+
+      - name: Check the package metadata points at this repository
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          meta="$(npm view "$PACKAGE@$VERSION" repository.url homepage bugs.url --json --prefer-online)"
+          echo "$meta"
+          repo_url="$(jq -r '."repository.url" // empty' <<< "$meta")"
+          homepage="$(jq -r '.homepage // empty' <<< "$meta")"
+          bugs_url="$(jq -r '."bugs.url" // empty' <<< "$meta")"
+          expected="https://github.com/$REPOSITORY"
+          normalized_repo="${repo_url#git+}"
+          normalized_repo="${normalized_repo%.git}"
+          failed=0
+          # GitHub owner and repository names are case-insensitive.
+          lower() { tr '[:upper:]' '[:lower:]' <<< "$1"; }
+          check() {
+            if [[ "$(lower "$2")" != "$(lower "$3")" ]]; then
+              echo "::error::$PACKAGE@$VERSION $1 is '$2', expected '$3'."
+              failed=1
+            fi
+          }
+          check repository.url "$normalized_repo" "$expected"
+          check homepage "$homepage" "$expected#readme"
+          check bugs.url "$bugs_url" "$expected/issues"
+          exit "$failed"
+
+      - name: Global install from the registry
+        run: |
+          set -euo pipefail
+          prefix="$(mktemp -d)"
+          npm install -g --no-audit --no-fund --prefix "$prefix" "$PACKAGE@$VERSION"
+          reported="$("$prefix/bin/novaos-cli" -V)"
+          if [[ "$reported" != "$VERSION" ]]; then
+            echo "::error::npm install -g $PACKAGE@$VERSION installed $reported."
+            exit 1
+          fi
+          "$prefix/bin/novaos-cli" --help > /dev/null
+          HOME="$(mktemp -d)" "$prefix/bin/novaos-cli" env list
+
+      - name: npx
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          npx --yes "$PACKAGE@$VERSION" --help > /dev/null
+
+      - name: Verify the provenance attestation
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          echo '{ "name": "provenance-check", "version": "0.0.0", "private": true }' > package.json
+          npm install --no-audit --no-fund "$PACKAGE@$VERSION"
+          report="$(npm audit signatures 2>&1)"
+          echo "$report"
+          if ! grep -Eq '[0-9]+ packages? (has|have) a verified attestation' <<< "$report"; then
+            echo "::error::npm audit signatures reported no verified provenance attestation for $PACKAGE@$VERSION."
+            exit 1
+          fi

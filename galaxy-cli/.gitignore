@@ -1,0 +1,4 @@
+# Generated scratch fixtures written by tests/app-provision/*.test.ts at
+# runtime (each test's beforeEach/afterEach clears its own subdirectory, but
+# an interrupted run can leave this behind).
+tests/app-provision/__fixtures__/
