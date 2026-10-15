@@ -105,11 +105,36 @@ function unwrapCandidate(body: unknown): { logs: unknown[]; total: number } | nu
   return null;
 }
 
+/** Platform-added metadata keys; already shown elsewhere or not useful to an agent author. */
+const PLATFORM_METADATA_KEYS = new Set(["agent_id", "instance_id", "trace_id", "run_id"]);
+
+function formatMetadataValue(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+/**
+ * Indented `key: value` lines for the agent-emitted metadata (error, exc_info, ...)
+ * of warn/error entries. Multi-line values (tracebacks) keep their line breaks.
+ */
+function formatMetadataDetails(entry: LogEntry): string {
+  if (entry.level === "info" || !entry.metadata) return "";
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(entry.metadata)) {
+    if (PLATFORM_METADATA_KEYS.has(key) || value === null || value === undefined || value === "") {
+      continue;
+    }
+    const [first = "", ...rest] = formatMetadataValue(value).split("\n");
+    lines.push(`    ${DIM}${key}:${RESET} ${first}`);
+    for (const line of rest) lines.push(`      ${line}`);
+  }
+  return lines.length > 0 ? "\n" + lines.join("\n") : "";
+}
+
 function formatLogEntry(entry: LogEntry): string {
   const color = LEVEL_COLORS[entry.level] ?? "";
   const ts = entry.timestamp.replace("T", " ").replace("Z", "");
   const runTag = entry.run_id ? ` ${DIM}[run:${entry.run_id.slice(0, 8)}]${RESET}` : "";
-  return `${DIM}${ts}${RESET} ${color}${entry.level.toUpperCase().padEnd(5)}${RESET} [${entry.source}]${runTag} ${entry.message}`;
+  return `${DIM}${ts}${RESET} ${color}${entry.level.toUpperCase().padEnd(5)}${RESET} [${entry.source}]${runTag} ${entry.message}${formatMetadataDetails(entry)}`;
 }
 
 export async function agentLogs(

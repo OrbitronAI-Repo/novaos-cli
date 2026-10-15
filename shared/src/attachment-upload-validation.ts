@@ -25,7 +25,7 @@ export const DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
  * Stricter than general marketplace API RPM (100/min).
  * Stops automated attachment upload bursts (Burp Intruder-style fuzzing).
  */
-export const CHAT_ATTACHMENT_UPLOAD_MAX_PER_WINDOW = 10;
+export const CHAT_ATTACHMENT_UPLOAD_MAX_PER_WINDOW = 60;
 export const CHAT_ATTACHMENT_UPLOAD_WINDOW_MS = 60_000;
 export const CHAT_ATTACHMENT_UPLOAD_RATE_LIMIT_MAX_KEYS = 10_000;
 

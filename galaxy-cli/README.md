@@ -17,7 +17,6 @@ CLI surface (commands under `src/`):
 | Execution & evaluation  | `novaos-cli run`, `novaos-cli eval`                                                                                                                                              |
 | MCP tooling             | `novaos-cli mcp validate`, `novaos-cli mcp publish`, `novaos-cli mcp init`, `novaos-cli mcp invoke`, `novaos-cli mcp register`, `novaos-cli mcp logs`, `novaos-cli mcp pod-logs` |
 | **Connector tooling**   | `novaos-cli connector list`, `novaos-cli connector init`, `novaos-cli connector publish`, `novaos-cli connector register`                                                        |
-| Operations              | `novaos-cli heartbeat`                                                                                                                                                           |
 | Environment management  | `novaos-cli env add`, `novaos-cli env use`, `novaos-cli env list`, `novaos-cli env show`                                                                                         |
 
 The **public contract** is the stable CLI interface and documented flags; internal modules are not considered a semver API for external plugins.
@@ -203,8 +202,7 @@ Returns a 404 or 501 with an informational message when the Connector Registry i
 Registers a connector for a tenant: configures its credentials, then grants an entitlement.
 
 > **Requires the `platform-admin` role** (not just `developer`) — it writes a tenant's live
-> credentials and directly enables their access, the same risk tier as `release promote`/
-> `rollback` and `shadow deploy`/`promote`/`rollback`.
+> credentials and directly enables their access, the same risk tier as `shadow deploy`/`promote`/`rollback`.
 
 ```bash
 novaos-cli connector register <name> --tenant-id <id> --max-tier <tier> \

@@ -224,13 +224,22 @@ export const CONTENT_NEGOTIATION_ERROR_CODES: ReadonlySet<number> = new Set<numb
  * Every other status is passed through unchanged: they are
  * not this specific, previously-seen shape of failure.
  */
+/**
+ * Whether a non-2xx status on the initial A2A POST means the pod has no route
+ * at `A2A_JSONRPC_PATH`. That is a property of the image, so retrying the
+ * request against the same pod cannot succeed.
+ */
+export function isMissingA2ARouteStatus(status: number): boolean {
+  return status === 404 || status === 405;
+}
+
 export function describeA2ATransportFailure(
   status: number,
   statusText: string,
   body: string
 ): string {
   const suffix = body ? ` — ${body}` : "";
-  if (status === 404 || status === 405) {
+  if (isMissingA2ARouteStatus(status)) {
     return (
       `${status} ${statusText}${suffix} (no A2A route at "${A2A_JSONRPC_PATH}" on this pod — ` +
       `it is likely a pre-A2A image that has not been rebuilt/republished on the A2A SDK)`

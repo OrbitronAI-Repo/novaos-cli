@@ -8,8 +8,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve, join, dirname } from "node:path";
 
 import { extractA2AResponseText, sendA2AMessage } from "./a2a-client.js";
 
@@ -47,11 +47,60 @@ type AgentLanguage = "typescript" | "python" | "java";
 // Language detection
 // ---------------------------------------------------------------------------
 
-export function detectAgentLanguage(dir: string): AgentLanguage | null {
-  if (existsSync(join(dir, "package.json"))) return "typescript";
-  if (existsSync(join(dir, "requirements.txt"))) return "python";
-  if (existsSync(join(dir, "pom.xml"))) return "java";
+const MANIFEST_LANGUAGES: readonly AgentLanguage[] = ["typescript", "python", "java"];
+
+function readManifestLanguage(dir: string): AgentLanguage | null {
+  const manifestPath = join(dir, "manifest.json");
+  if (!existsSync(manifestPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf-8")) as { language?: unknown };
+    return MANIFEST_LANGUAGES.find((l) => l === parsed.language) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isWorkspaceRoot(dir: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8")) as {
+      workspaces?: unknown;
+    };
+    return pkg.workspaces !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the agent project root and its language.
+ *
+ * The nearest `manifest.json` (from `dir` upwards) that declares a `language`
+ * wins over filesystem heuristics, so a parent `package.json` cannot turn a
+ * Python agent into a TypeScript one. Without a manifest, `dir` is classified
+ * by its marker files — except a monorepo workspace root, which is never an
+ * agent and is reported as undetectable rather than guessed as TypeScript.
+ */
+export function resolveAgentProject(dir: string): { root: string; language: AgentLanguage } | null {
+  let current = resolve(dir);
+  for (;;) {
+    const language = readManifestLanguage(current);
+    if (language) return { root: current, language };
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  const start = resolve(dir);
+  if (existsSync(join(start, "package.json"))) {
+    return isWorkspaceRoot(start) ? null : { root: start, language: "typescript" };
+  }
+  if (existsSync(join(start, "requirements.txt"))) return { root: start, language: "python" };
+  if (existsSync(join(start, "pom.xml"))) return { root: start, language: "java" };
   return null;
+}
+
+export function detectAgentLanguage(dir: string): AgentLanguage | null {
+  return resolveAgentProject(dir)?.language ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,16 +167,20 @@ export async function pollHealth(
 
 export async function runAgent(options: RunAgentOptions): Promise<{ exitCode: number }> {
   const port = options.port ?? DEFAULT_AGENT_PORT;
-  const cwd = resolve(options.cwd ?? process.cwd());
+  const requestedCwd = resolve(options.cwd ?? process.cwd());
   const inputText = options.input ?? DEFAULT_INPUT;
 
-  const language = detectAgentLanguage(cwd);
-  if (!language) {
+  const project = resolveAgentProject(requestedCwd);
+  if (!project) {
     process.stderr.write(
-      "Could not detect agent language. Expected package.json (TS), requirements.txt (Python), or pom.xml (Java).\n"
+      `Could not detect agent language in ${requestedCwd}. Expected a manifest.json with "language", ` +
+        "or package.json (TS), requirements.txt (Python), or pom.xml (Java).\n" +
+        "If you ran this through the repo-root `bun run novaos-cli`, the working directory is the repo root; " +
+        "pass --cwd packages/<agent> or run `bun ../galaxy-cli/src/cli.ts run` from the agent directory.\n"
     );
     return { exitCode: 1 };
   }
+  const { language, root: cwd } = project;
 
   process.stderr.write(`Detected language: ${language}\n`);
 

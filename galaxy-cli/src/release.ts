@@ -3,8 +3,6 @@
  *
  * Provides:
  *   novaos-cli release create   --agent <id> --channel <canary|beta|stable> --version <semver>
- *   novaos-cli release promote  --agent <id> --from <channel> --to <channel>
- *   novaos-cli release rollback --agent <id> --channel <channel>
  *   novaos-cli release list     --agent <id> [--json]
  *
  * All commands target the AgentOps service (/api/v1/agent-ops/*).
@@ -39,19 +37,6 @@ export interface ReleaseCreateOptions {
   json?: boolean;
 }
 
-export interface ReleasePromoteOptions {
-  agentId: string;
-  from: ReleaseChannel;
-  to: ReleaseChannel;
-  json?: boolean;
-}
-
-export interface ReleaseRollbackOptions {
-  agentId: string;
-  channel: ReleaseChannel;
-  json?: boolean;
-}
-
 export interface ReleaseListOptions {
   agentId: string;
   json?: boolean;
@@ -67,17 +52,6 @@ export interface ReleaseEntry {
 
 interface AgentOpsResponse<T> {
   data: T;
-}
-
-export interface PromoteResult {
-  success: boolean;
-  message: string;
-  promoted_version?: string;
-}
-
-export interface RollbackResult {
-  success: boolean;
-  message: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,44 +170,6 @@ export async function releaseCreate(
       `✓ Release created: ${entry.agentId} v${entry.version} → ${entry.channel}\n`
     );
   }
-}
-
-/**
- * There is no release-channel promote/rollback endpoint on the server —
- * `/api/v1/agent-ops/shadow/promote` and `/shadow/rollback` are a different
- * feature (shadow-traffic testing) with an incompatible request/response
- * contract. releasePromote/releaseRollback previously called those endpoints
- * anyway, which either failed schema validation or silently executed
- * shadow-rollback semantics instead of anything release-channel-related.
- * Disabled here until real backend support for release-channel
- * promote/rollback exists, rather than leaving either failure mode in place.
- */
-const RELEASE_PROMOTE_ROLLBACK_UNSUPPORTED =
-  "not currently supported: there is no release-channel promote/rollback endpoint on the " +
-  "server. This command is disabled until that backend support exists.";
-
-/**
- * novaos-cli release promote --agent <id> --from <channel> --to <channel>
- *
- * Disabled — see RELEASE_PROMOTE_ROLLBACK_UNSUPPORTED.
- */
-export async function releasePromote(
-  _client: GalaxyHttpClient,
-  _opts: ReleasePromoteOptions
-): Promise<PromoteResult> {
-  throw new Error(`'release promote' is ${RELEASE_PROMOTE_ROLLBACK_UNSUPPORTED}`);
-}
-
-/**
- * novaos-cli release rollback --agent <id> --channel <channel>
- *
- * Disabled — see RELEASE_PROMOTE_ROLLBACK_UNSUPPORTED.
- */
-export async function releaseRollback(
-  _client: GalaxyHttpClient,
-  _opts: ReleaseRollbackOptions
-): Promise<RollbackResult> {
-  throw new Error(`'release rollback' is ${RELEASE_PROMOTE_ROLLBACK_UNSUPPORTED}`);
 }
 
 /**

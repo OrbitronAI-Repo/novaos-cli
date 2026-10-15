@@ -505,12 +505,7 @@ export async function agentPublish(client: GalaxyHttpClient, opts: PublishOption
 
   const targetPlatform = resolveTargetPlatform(platformOverride, envName);
 
-  // Step 1: Docker pre-flight
-  if (!json) stderr("Checking Docker... ");
-  ensureDocker();
-  if (!json) stderr("ok\n");
-
-  // Step 2: Read and validate manifest
+  // Step 1: Read and validate manifest
   if (!json) stderr("Validating manifest... ");
   const rawContent = readFileSync(path.resolve(manifestPath), "utf-8");
   const rawManifest = JSON.parse(rawContent);
@@ -576,6 +571,14 @@ export async function agentPublish(client: GalaxyHttpClient, opts: PublishOption
   const contextDir = contextOverride
     ? path.resolve(contextOverride)
     : path.dirname(path.resolve(manifestPath));
+
+  // Docker is only needed to build and push, so a dry run skips it. A real publish
+  // checks it before authorizing, so a missing daemon fails without a server round trip.
+  if (!dryRun) {
+    if (!json) stderr("Checking Docker... ");
+    ensureDocker();
+    if (!json) stderr("ok\n");
+  }
 
   // Step 4: Request publish authorization
   if (!json) stderr("Requesting publish authorization... ");

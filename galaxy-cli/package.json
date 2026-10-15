@@ -1,6 +1,6 @@
 {
   "name": "novaos-cli",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Galaxy CLI \u2014 Agent Development Lifecycle tooling for NovaOS",
   "license": "MIT",
   "author": "NovaOS Team",

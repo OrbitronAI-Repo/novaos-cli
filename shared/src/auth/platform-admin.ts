@@ -7,9 +7,12 @@
 export const PLATFORM_ADMIN_ROLES = ["admin", "novaos-admin", "platform-admin"] as const;
 
 /**
- * Resource-scope that grants platform admin for M2M (client_credentials) tokens.
- * Marketplace BFF mints tokens with this scope after requireAdmin(); downstream
- * services must accept it via requireAdminRole (roles OR this scope).
+ * Resource-scope that grants platform admin for tokens that carry scopes but
+ * no role claims: Logto M2M (client_credentials) apps that hold it through an
+ * M2M role on the `urn:novaos` resource, and operator-supplied service tokens
+ * (for example the connector-host admin token). No service in this repo mints it
+ * on demand. Downstream services must accept it via requireAdminRole (roles OR
+ * this scope).
  */
 export const PLATFORM_ADMIN_SCOPE = "platform:admin" as const;
 
@@ -22,7 +25,8 @@ export function isPlatformAdmin(roles: string[] | undefined): boolean {
 
 /**
  * True when scopes include `platform:admin` (case-insensitive).
- * Used for M2M BFF→service hops where the access token has no role claims.
+ * Used for service-to-service tokens (M2M apps, operator-supplied tokens) whose
+ * access token has no role claims.
  */
 export function hasPlatformAdminScope(scopes: string[] | undefined): boolean {
   if (!scopes?.length) return false;
@@ -33,7 +37,8 @@ export function hasPlatformAdminScope(scopes: string[] | undefined): boolean {
 /**
  * Platform admin via JWT roles OR M2M `platform:admin` scope.
  * Prefer this (or requireAdminRole) over isPlatformAdmin(roles) alone on
- * AuthContext gates — M2M tokens from the admin BFF have scopes, not roles.
+ * AuthContext gates — M2M and operator-supplied service tokens have scopes, not
+ * roles.
  */
 export function hasPlatformAdminAccess(
   roles: string[] | undefined,

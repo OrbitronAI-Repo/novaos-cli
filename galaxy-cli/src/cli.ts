@@ -49,7 +49,7 @@ import {
 } from "./config.js";
 import { connectorList, connectorInit, connectorPublish, connectorRegister } from "./connector.js";
 import { RETRY_MODES } from "./constants.js";
-import { debugTrace, debugWatch, debugCompare, debugBreakpoint } from "./debug.js";
+import { debugTrace, debugWatch, debugCompare } from "./debug.js";
 import {
   type EnvironmentConfigEntry,
   type EnvironmentName,
@@ -65,7 +65,6 @@ import {
 } from "./environments.js";
 import { evalLocal } from "./eval-local.js";
 import { evalRun, evalList } from "./eval.js";
-import { heartbeatList, heartbeatStatus, heartbeatCreate } from "./heartbeat.js";
 import { type GalaxyHttpClient, createGalaxyHttpClient } from "./http-client.js";
 import { validateManifest } from "./manifest.js";
 import { mcpInit } from "./mcp-init.js";
@@ -82,7 +81,7 @@ import {
   resolvePublisherSlugForInit,
 } from "./publisher.js";
 import { isPreCutoverIndex, PYTHON_SDK_PRE_CUTOVER_WARNING } from "./python-sdk-release.js";
-import { releaseCreate, releasePromote, releaseRollback, releaseList } from "./release.js";
+import { releaseCreate, releaseList } from "./release.js";
 import { sandboxStart, sandboxStop, sandboxStatus } from "./sandbox.js";
 import {
   shadowDeploy,
@@ -92,7 +91,6 @@ import {
   shadowSummary,
   type ShadowEvaluationConfig,
 } from "./shadow.js";
-import { skillList, skillCall } from "./skill.js";
 
 // Statically imported (not read at runtime via fs) so the version survives
 // `bun build --compile`: a compiled binary's virtual filesystem doesn't
@@ -831,48 +829,6 @@ release
   });
 
 release
-  .command("promote")
-  .description("Promote latest version from one channel to another")
-  .requiredOption("--agent <id>", "Agent ID")
-  .requiredOption("--from <channel>", "Source channel")
-  .requiredOption("--to <channel>", "Target channel")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
-    try {
-      await requirePlatformAdmin();
-      await releasePromote(await getAgentOpsClient(), {
-        agentId: opts.agent,
-        from: opts.from,
-        to: opts.to,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-release
-  .command("rollback")
-  .description("Roll back a release channel to the previous version")
-  .requiredOption("--agent <id>", "Agent ID")
-  .requiredOption("--channel <channel>", "Release channel to roll back")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
-    try {
-      await requirePlatformAdmin();
-      await releaseRollback(await getAgentOpsClient(), {
-        agentId: opts.agent,
-        channel: opts.channel,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-release
   .command("list")
   .description("List all release versions for an agent")
   .requiredOption("--agent <id>", "Agent ID")
@@ -1588,52 +1544,6 @@ program
   });
 
 // ---------------------------------------------------------------------------
-// skill
-// ---------------------------------------------------------------------------
-
-const skill = program.command("skill").description("Skills platform commands");
-
-skill
-  .command("list")
-  .description("List available skills")
-  .option("--agent-id <id>", "Filter by agent ID")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
-    try {
-      await requireDeveloperRole();
-      await skillList(await getGatewayClient(), {
-        agentId: opts.agentId,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-skill
-  .command("call")
-  .description("Invoke a skill on an agent")
-  .argument("<skill-name>", "Name of the skill to invoke")
-  .requiredOption("--agent-id <id>", "Agent ID")
-  .requiredOption("--input <json>", "Input arguments as JSON string")
-  .option("--json", "Output as JSON")
-  .action(async (skillName: string, opts) => {
-    try {
-      await requireDeveloperRole();
-      await skillCall(await getGatewayClient(), {
-        skillName,
-        agentId: opts.agentId,
-        input: opts.input,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-// ---------------------------------------------------------------------------
 // connector
 // ---------------------------------------------------------------------------
 
@@ -1769,70 +1679,6 @@ connector
   });
 
 // ---------------------------------------------------------------------------
-// heartbeat
-// ---------------------------------------------------------------------------
-
-const heartbeat = program.command("heartbeat").description("Agent heartbeat management");
-
-heartbeat
-  .command("list")
-  .description("List heartbeat configurations for an agent")
-  .requiredOption("--agent-id <id>", "Agent ID")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
-    try {
-      await requireDeveloperRole();
-      await heartbeatList(await getAgentOpsClient(), {
-        agentId: opts.agentId,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-heartbeat
-  .command("status")
-  .description("Show heartbeat status for an agent")
-  .requiredOption("--agent-id <id>", "Agent ID")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
-    try {
-      await requireDeveloperRole();
-      await heartbeatStatus(await getAgentOpsClient(), {
-        agentId: opts.agentId,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-heartbeat
-  .command("create")
-  .description("Create a new heartbeat configuration")
-  .requiredOption("--agent-id <id>", "Agent ID")
-  .requiredOption("--schedule <cron>", "Cron schedule expression")
-  .requiredOption("--workflow <name>", "Workflow name to execute")
-  .option("--json", "Output as JSON")
-  .action(async (opts) => {
-    try {
-      await requireDeveloperRole();
-      await heartbeatCreate(await getAgentOpsClient(), {
-        agentId: opts.agentId,
-        schedule: opts.schedule,
-        workflow: opts.workflow,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-// ---------------------------------------------------------------------------
 // debug
 // ---------------------------------------------------------------------------
 
@@ -1886,24 +1732,6 @@ debug
       await debugCompare(await getGatewayClient(), {
         runIdA,
         runIdB,
-        json: opts.json,
-      });
-    } catch (error) {
-      process.stderr.write(`Error: ${stringifyError(error)}\n`);
-      process.exit(1);
-    }
-  });
-
-debug
-  .command("breakpoint")
-  .description("Attach to a debug session with breakpoint controls")
-  .argument("<run-id>", "Run ID with active debug session")
-  .option("--json", "Output events as JSON")
-  .action(async (runId: string, opts) => {
-    try {
-      await requireDeveloperRole();
-      await debugBreakpoint(await getGatewayClient(), {
-        runId,
         json: opts.json,
       });
     } catch (error) {
