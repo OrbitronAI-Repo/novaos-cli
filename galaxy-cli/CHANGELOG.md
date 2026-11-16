@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-16
+
+### Fixed
+
+- `brew install` and `brew upgrade` now get this release. 2.2.0 reached npm and GitHub Releases but not the Homebrew tap: the release's post-publish check ran on a macOS runner image that GitHub no longer provides, so the release stopped before it updated the tap. 2.2.1 has the same CLI as 2.2.0; only the release process changed.
+
 ## [2.2.0] - 2026-11-16
 
 ### Added
