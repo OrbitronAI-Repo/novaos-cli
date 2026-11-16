@@ -20,6 +20,8 @@ export const DEFAULT_MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10MB
 // --- Rate and concurrency ---
 export const DEFAULT_RATE_LIMIT_RPS = 10;
 export const DEFAULT_CONCURRENCY_LIMIT = 5;
+// Most turns a conversation keeps waiting behind the running one before new messages are refused.
+export const DEFAULT_CONVERSATION_QUEUE_CAP = 10;
 
 // --- Tenant LLM Gateway rate limits (platform defaults) ---
 export const DEFAULT_TENANT_RPM = 60;

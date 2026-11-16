@@ -4,22 +4,78 @@
 
 ## Purpose
 
-Command-line tool for agent developers to **build, test, publish, activate, and manage** agents on the NovaOS platform. The entry point is the `novaos-cli` command. It targets the **developer experience** layer: it does not run as a cluster service but orchestrates calls to control- and execution-plane HTTP APIs.
+Command-line tool for agent developers to **build, test, publish, and manage** agents on the NovaOS platform. The entry point is the `novaos-cli` command. It targets the **developer experience** layer: it does not run as a cluster service but orchestrates calls to control- and execution-plane HTTP APIs.
 
 ## Public API surface
 
-CLI surface (commands under `src/`):
+Commands (registered in `src/cli.ts`; `app` in `src/app-provision/register-cli.ts`). Run `novaos-cli <command> --help` for flags.
 
-| Command group           | Examples                                                                                                                                                                         |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scaffolding & migration | `novaos-cli init`, `novaos-cli migrate`                                                                                                                                          |
-| Shipping & lifecycle    | `novaos-cli publish`, `novaos-cli activate`, `novaos-cli release`, `novaos-cli shadow`                                                                                           |
-| Execution & evaluation  | `novaos-cli run`, `novaos-cli eval`                                                                                                                                              |
-| MCP tooling             | `novaos-cli mcp validate`, `novaos-cli mcp publish`, `novaos-cli mcp init`, `novaos-cli mcp invoke`, `novaos-cli mcp register`, `novaos-cli mcp logs`, `novaos-cli mcp pod-logs` |
-| **Connector tooling**   | `novaos-cli connector list`, `novaos-cli connector init`, `novaos-cli connector publish`, `novaos-cli connector register`                                                        |
-| Environment management  | `novaos-cli env add`, `novaos-cli env use`, `novaos-cli env list`, `novaos-cli env show`                                                                                         |
+| Group                  | Commands                                                                                                                                     | Notes                                                                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Meta                   | `version`, `completion`                                                                                                                      | Shell completion script                                                                                                                        |
+| Auth                   | `auth login`, `logout`, `whoami`, `token`; `auth org list`, `org use`, `org show`                                                            | See [Authentication](#authentication)                                                                                                          |
+| Publisher              | `publisher show`                                                                                                                             | Publisher slug from Marketplace membership                                                                                                     |
+| Environments           | `env add`, `use`, `list`, `show`                                                                                                             | See [Environment configuration](#environment-configuration)                                                                                    |
+| Agent scaffolding      | `init` (`--lang typescript\|python\|java`), `migrate` (v1.x → v2.0 manifest), `manifest validate`                                            |                                                                                                                                                |
+| Shipping               | `publish`, `publish-status`; `release create`, `release list`                                                                                | Release channels: `canary`, `beta`, `stable`                                                                                                   |
+| Agent inspection       | `agent list`, `agent logs` (Loki-backed), `agent pod-logs` (raw container output)                                                            |                                                                                                                                                |
+| Local development      | `run` (start the agent locally and send a test request), `test` (discover and run project tests, `--sandbox`), `sandbox start\|stop\|status` | Sandbox wraps `docker compose -f docker-compose.sandbox.yml`, found by walking up from the CWD (5 levels) or via `NOVAOS_SANDBOX_COMPOSE_FILE` |
+| Evaluation             | `eval run`, `eval list`, `eval local`                                                                                                        | Through the Execution Gateway (`/api/v1/suites/...`, `/api/v1/agents/:id/eval-runs`). Exit codes 0 pass, 1 fail, 2 error                       |
+| Shadow testing         | `shadow deploy`, `promote`, `rollback`, `replay`, `summary`                                                                                  | Agent Ops `/api/v1/agent-ops/shadow/*`; require `platform-admin`                                                                               |
+| MCP tooling            | `mcp init`, `validate`, `publish`, `register`, `invoke` (local sandbox gateway only), `logs`, `pod-logs`                                     | MCP Ops                                                                                                                                        |
+| Connector tooling      | `connector list`, `init`, `publish`, `register`                                                                                              | See [Connector commands](#connector-commands)                                                                                                  |
+| Debugging              | `debug trace <run-id>`, `debug watch <run-id>` (SSE), `debug compare`                                                                        | Gateway debug routes; `watch`/`compare` need `DEBUGGER_ENABLED` on the gateway                                                                 |
+| Application onboarding | `app provision`, `verify-deploy`, `bind-subscription`, `unbind`, `rotate-sa`                                                                 | Platform onboarding of NovaOS applications                                                                                                     |
 
 The **public contract** is the stable CLI interface and documented flags; internal modules are not considered a semver API for external plugins.
+
+After `publish`, run `novaos-cli publish-status <review-id> --wait` (the id is printed by `publish`). It prints one plain sentence for the review state on stderr and, with `--wait [--timeout <seconds>]`, polls until the version is `ACTIVE`, `REJECTED` or `ROLLED_BACK` (default timeout 900 seconds). It exits 0 for `ACTIVE`, and 1 for `REJECTED`, `ROLLED_BACK`, a timeout, or a failed `--verify` Agent Card check. `--json` output has no sentences or next-step text.
+
+### Global flags
+
+| Flag                         | Env var                     | Purpose                                                                    |
+| ---------------------------- | --------------------------- | -------------------------------------------------------------------------- |
+| `--env <name>`               | `NOVAOS_ENV`                | Target environment                                                         |
+| `--agent-ops-url <url>`      | `NOVAOS_AGENT_OPS_URL`      | Override Agent Ops URL                                                     |
+| `--mcp-ops-url <url>`        | `NOVAOS_MCP_OPS_URL`        | Override MCP Ops URL                                                       |
+| `--review-url <url>`         | `NOVAOS_REVIEW_URL`         | Override Review service URL                                                |
+| `--gateway-url <url>`        | `NOVAOS_GATEWAY_URL`        | Override Execution Gateway URL                                             |
+| `--iam-url <url>`            | `NOVAOS_IAM_URL`            | Override IAM (Logto) URL                                                   |
+| `--connector-host-url <url>` | `NOVAOS_CONNECTOR_HOST_URL` | Override connector-host URL                                                |
+| `--client-id <id>`           | `NOVAOS_CLIENT_ID`          | Override OAuth client ID                                                   |
+| `--retry-mode <mode>`        | `NOVAOS_RETRY_MODE`         | HTTP retries: `none`, `standard` (default), `adaptive`                     |
+| `--max-attempts <n>`         | `NOVAOS_MAX_ATTEMPTS`       | Max HTTP attempts including the first (default 3)                          |
+| `--debug`                    | —                           | Print wire-level HTTP detail to stderr (bearer and ID tokens are redacted) |
+
+Most commands that call an API also accept `--json` for machine-readable output.
+
+## Agent lifecycle
+
+The usual path for a Python agent, in order:
+
+```bash
+novaos-cli init --name my-agent --lang python
+cd my-agent
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+novaos-cli test                                 # run the project's tests
+novaos-cli run --input "Alice"                  # start the agent locally, send one message
+novaos-cli manifest validate manifest.json
+novaos-cli auth login
+novaos-cli publish manifest.json --dry-run      # validate and authorize; no build or push
+novaos-cli publish manifest.json                # prints the review ID and agent ID
+novaos-cli publish-status <review-id> --wait    # until ACTIVE, REJECTED or ROLLED_BACK
+```
+
+`publish` needs a real publisher in `manifest.json` (`novaos-cli publisher show` prints yours); `init` without sign-in writes a placeholder that `publish` refuses. A new version waits for a platform admin to approve it, unless the environment's approval policy approves it automatically. Once it is `ACTIVE`, install your own copy and run it: [Installing and running a published agent](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/installing-and-running/). [Steps that need a person](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/steps-that-need-a-person/) lists sign-in, approval and the web-UI install, and how a coding assistant should behave at each.
+
+Python agents are built on the SDK [`novaos-agent-sdk` on PyPI](https://pypi.org/project/novaos-agent-sdk/) (import `novaos_client_sdk`). `init --lang python` also writes `AGENTS.md`, which coding assistants such as Claude Code and Codex read on their own, with these steps, which ID is which and when to stop and ask a person, and a `CLAUDE.md` that imports it.
+
+## Authentication
+
+`auth login` runs OAuth2 Authorization Code + PKCE against Logto in the browser, with a local callback on the first free port of 8976–8978 (`/callback`). Tokens are stored in `~/.novaos/credentials.json` (mode `0600`) and refreshed automatically 60 s before expiry. `auth org use` switches the active Logto organization and fetches an org-scoped token; `auth token` prints the current access token for scripts.
+
+Mutating commands check the token's roles first: `developer` for most, `platform-admin` for `shadow *` and `connector register`. These checks are client-side UX only — the services enforce authorization.
 
 ---
 
@@ -134,46 +190,56 @@ Output:
 
 #### OpenAPI codegen mode (`--spec`)
 
-Generates typed TypeScript operation handlers from an OpenAPI 3.x spec:
+Generates a connector package from an OpenAPI 3.x spec (JSON or YAML). Swagger 2.0 is rejected with a hint to convert it first (for example `npx swagger2openapi`).
 
 ```bash
 novaos-cli connector init \
-  --name stripe \
+  --name drive \
   --publisher acme-corp \
-  --spec ./openapi/stripe.yaml \
-  --dir ./packages/connector-stripe
+  --spec ./openapi/drive.json \
+  --include-path /drive/v3/files \
+  --risk read \
+  --dir ./packages/connector-drive
 ```
 
 Output:
 
 ```
-./packages/connector-stripe/
-  connector.json          # starter manifest — edit governance fields before deploying
+./packages/connector-drive/
+  connector.json          # generated manifest — always overwritten on re-run
+  NOTICE.md               # spec license / terms, when the spec declares one
   src/
-    connector.ts          # entry point
-    operations/
-      list-charges.ts     # one file per operationId
+    connector.ts          # module.exports = { "<operation>": handler }
+    http.ts               # query / form / response helpers
+    types.ts              # ConnectorContext
+    operations/           # one (input, ctx) handler per operation
   tsconfig.json
-  package.json
+  package.json            # build = tsc + esbuild bundle to dist/connector.js
 ```
 
-The pipeline:
+The generated code follows the connector-host runtime contract: one bundled script, `require` limited to `zod`, `crypto` and `url`, and all HTTP through `ctx.fetch`.
 
-1. Reads the OpenAPI spec
-2. Extracts server hostnames → `allowed_domains` in `connector.json`
-3. Generates a typed handler stub for each operation with an `operationId`
-4. Writes a starter `connector.json` with `data_tier: "information"` — **edit governance fields before deploying**
+What the pipeline does:
 
-> The generated `connector.json` uses a merge-safe write strategy. If `connector.json` already exists, only new operation entries are added; manually edited fields are preserved.
+1. Inlines local `$ref`s (recursive or very deep schemas collapse to a plain object) and keeps only the operations whose path starts with an `--include-path` prefix and whose risk class matches `--risk`, if given.
+2. Extracts server hostnames → `ssrf.allowed_domains` / `declared_egress`, and embeds the first absolute server URL as the base URL. `http://` servers are upgraded to HTTPS.
+3. Sends path, query and header parameters, and a JSON or form-urlencoded body. Operations with multipart or binary bodies are skipped and reported.
+4. Maps `securitySchemes` to credential classes: an authorization-code OAuth flow → `oauth` block (Class 3, narrowest scope per operation); bearer / API key → `apiKey` field and HTTP Basic → `username` / `password` fields (Class 2). Operations read `ctx.credentials.accessToken` first. Parameters that carry credentials (`token`, `api_key`, …) are dropped from the input schema, so secrets never travel through tool input. Class 1 OAuth client secrets are never written; only the env var names are.
+5. Sets a per-operation `risk` (`read` for GET, `write` for other methods, `destructive` for DELETE or delete-like names) and prefixes the description with it. connector-host refuses `destructive` operations without a bound human approval.
+6. Writes `data_tier: "raw"` and `data_license: "proprietary"` — review them before deploying.
+
+Warnings are printed for things to review: tenant-specific server URLs (replace them in the spec's `servers` before generating), specs with no license, OAuth flows with no scopes (no `oauth` block is generated, because connector-host requires at least one scope), ignored security schemes, more than 150 operations, and a manifest large enough (over about 8 MB) to approach connector-host's 10 MiB publish request limit. Approval is per tool, so prefer several narrow connectors over one wide one: run the generator once with `--risk read` and once with `--risk write --risk destructive` to get a read-only connector and its companion. OAuth scopes follow the operations that are kept, so the read-only connector requests only read scopes.
 
 **Flags:**
 
-| Flag                      | Required | Description                                      |
-| ------------------------- | -------- | ------------------------------------------------ |
-| `--name <name>`           | ✓        | Connector slug (lowercase, hyphens)              |
-| `--publisher <publisher>` | ✓        | Publisher identifier                             |
-| `--spec <path>`           | —        | Path to OpenAPI 3.x spec. Triggers codegen mode. |
-| `--dir <dir>`             | —        | Output directory. Defaults to `./<name>`         |
+| Flag                      | Required | Description                                                                                              |
+| ------------------------- | -------- | -------------------------------------------------------------------------------------------------------- |
+| `--name <name>`           | ✓        | Connector slug (lowercase, hyphens)                                                                      |
+| `--publisher <publisher>` | ✓        | Publisher identifier                                                                                     |
+| `--spec <path>`           | —        | Path to OpenAPI 3.x spec. Triggers codegen mode.                                                         |
+| `--include-path <prefix>` | —        | With `--spec`: only generate operations whose path starts with `<prefix>`. Repeatable.                   |
+| `--risk <level>`          | —        | With `--spec`: only generate operations of this risk class (`read`, `write`, `destructive`). Repeatable. |
+| `--dir <dir>`             | —        | Output directory. Defaults to `./<name>`                                                                 |
 
 ---
 
@@ -238,7 +304,7 @@ Credential sources layer in the order above (`--credential` lowest, `--credentia
 
 | Symptom                                 | Likely cause                                                                        | Mitigation                                                                            |
 | --------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Publish / activate fails mid-run        | **Auth token expired** during long operations                                       | Re-authenticate (login) and retry; keep sessions within token TTL for batch publishes |
+| Publish fails mid-run                   | **Auth token expired** during long operations                                       | Re-authenticate (login) and retry; keep sessions within token TTL for batch publishes |
 | Command exits with validation error     | **Manifest or config schema** mismatch                                              | Error output includes file and line where possible—fix the manifest and re-run        |
 | Connection refused / 5xx                | Target service (agent-ops, gateway, mcp-ops, connector-host) down or wrong base URL | Verify URLs and ports; use service READMEs and platform status                        |
 | `connector list/publish` returns notice | Connector Registry not deployed (404/501)                                           | Feature is rolling out; check the operator runbook for deployment status              |
@@ -247,7 +313,8 @@ For service-side incidents, use the on-call runbooks for **agent-ops**, **gatewa
 
 ## Upstream dependencies
 
-- **agent-ops** — HTTP API for publish, activate, releases, shadow, logs
+- **agent-ops** — HTTP API for publish, releases, shadow, agent list and logs
+- **review** — publish review pipeline status
 - **mcp-ops** — HTTP API for MCP tool operations
 - **gateway** — execution-plane entry (e.g. runs routed through the gateway stack)
 - **connector-host** — target for `novaos-cli connector list/register/publish` (`connectorHostUrl` / `--connector-host-url` / `NOVAOS_CONNECTOR_HOST_URL`)
@@ -267,9 +334,12 @@ Run directly with Bun, no build step needed:
 
 ```bash
 bun src/cli.ts --help
+bun run test                 # unit tests (src/ and tests/)
 ```
 
-Point the documented env vars (see [Environment configuration](#environment-configuration)) at your local or dev stack endpoints for agent-ops, gateway, and mcp-ops.
+Point the documented env vars (see [Environment configuration](#environment-configuration)) at your local or dev stack endpoints for agent-ops, gateway, and mcp-ops. Staging integration tests live in `tests/integration/` (`staging-*.test.ts`).
+
+Source layout: one module per command area in `src/` (`auth*.ts`, `environments.ts` + `config.ts`, `publish.ts`, `release.ts`, `shadow.ts`, `eval.ts`, `mcp-*.ts`, `connector.ts`, `sandbox.ts`, `run.ts`, `test-runner.ts`, `debug.ts`, …). Every HTTP call goes through `createGalaxyHttpClient()` (`src/http-client.ts`), which adds the bearer token, retries and `--debug` tracing. Init templates are compiled into `src/embedded-templates.generated.ts`. Releasing is described in [`RELEASING.md`](RELEASING.md).
 
 ## Installation
 

@@ -328,10 +328,22 @@ export function slugify(value: string): string {
  * direct. The manifest has no per-capability tags, so the agent-level
  * `metadata.tags` + `metadata.domains` apply to every skill — the spec requires
  * the field to be present.
+ *
+ * A schema 2.0 manifest declares its skills at the top level (`skills[]`, each with a
+ * `name` and `description`) and has no `metadata` block. When `metadata.capabilities`
+ * gives nothing and a top-level `declared` list is passed, that list is mapped the same
+ * way, with the manifest's own top-level `tags` + `domains` as the skill tags.
  */
-function buildSkills(metadata: Record<string, unknown>): AgentSkill[] {
-  const capabilities = Array.isArray(metadata.capabilities) ? metadata.capabilities : [];
-  const skillTags = [...stringArray(metadata.tags), ...stringArray(metadata.domains)];
+function buildSkills(
+  metadata: Record<string, unknown>,
+  declared?: { skills: unknown; tags: unknown; domains: unknown }
+): AgentSkill[] {
+  const fromMetadata = Array.isArray(metadata.capabilities) ? metadata.capabilities : [];
+  const useDeclared = fromMetadata.length === 0 && Array.isArray(declared?.skills);
+  const capabilities = useDeclared ? (declared.skills as unknown[]) : fromMetadata;
+  const skillTags = useDeclared
+    ? [...stringArray(declared.tags), ...stringArray(declared.domains)]
+    : [...stringArray(metadata.tags), ...stringArray(metadata.domains)];
 
   const skills: AgentSkill[] = [];
   // Every id handed out so far, suffixed ones included. Tracking the *emitted*
@@ -432,13 +444,19 @@ export function buildAgentCard(
 
   const metadata = isPlainObject(manifest.metadata) ? manifest.metadata : {};
 
-  const skills = runtime ? runtime.skills : buildSkills(metadata);
+  const skills = runtime
+    ? runtime.skills
+    : buildSkills(metadata, {
+        skills: manifest.skills,
+        tags: manifest.tags,
+        domains: manifest.domains,
+      });
   if (skills.length === 0) {
     throw new AgentCardGenerationError(
       runtime
         ? "the running agent registers no skills — add at least one @agent.skill() handler."
-        : "manifest declares no metadata.capabilities — an Agent Card needs at " +
-            "least one skill. Add a capability with a name and description."
+        : "manifest declares no metadata.capabilities and no named top-level skills — an " +
+            "Agent Card needs at least one skill. Add a capability or skill with a name and description."
     );
   }
 

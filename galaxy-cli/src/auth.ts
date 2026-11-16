@@ -110,6 +110,31 @@ export interface AuthModuleDeps {
   openBrowser?: (url: string) => Promise<void>;
   stderr?: { write: (s: string) => boolean };
   createHttpServer?: typeof createServer;
+  /** Test seam: how long login waits for the browser callback. Defaults to AUTH_TIMEOUT_MS. */
+  authTimeoutMs?: number;
+}
+
+/** "2 minutes" for the default; seconds for shorter (test) timeouts. */
+function formatAuthTimeout(ms: number): string {
+  if (ms >= 60_000 && ms % 60_000 === 0) {
+    const minutes = ms / 60_000;
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  return `${Math.max(1, Math.round(ms / 1000))} seconds`;
+}
+
+/**
+ * True for the failures a wrong IAM URL can produce: the browser callback never
+ * arrives (timeout), the token endpoint can't be reached, or it answers 404.
+ * Matches specific connection codes only, not any message mentioning "network".
+ */
+export function isIamUnreachableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    /timed out/i.test(message) ||
+    /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|ECONNRESET|EAI_AGAIN/.test(message) ||
+    /HTTP 404\b/.test(message)
+  );
 }
 
 /**
@@ -148,6 +173,7 @@ export function createAuthModule(deps?: AuthModuleDeps) {
     });
   const _stderr = deps?.stderr ?? process.stderr;
   const _createServer = deps?.createHttpServer ?? createServer;
+  const _authTimeoutMs = deps?.authTimeoutMs ?? AUTH_TIMEOUT_MS;
 
   function tryListenOnPort(port: number): Promise<ReturnType<typeof createServer>> {
     return new Promise((resolve, reject) => {
@@ -169,8 +195,12 @@ export function createAuthModule(deps?: AuthModuleDeps) {
     return new Promise<CallbackResult>((resolve, reject) => {
       const timeout = setTimeout(() => {
         server.close();
-        reject(new Error("Authentication timed out. No callback received within 2 minutes."));
-      }, AUTH_TIMEOUT_MS);
+        reject(
+          new Error(
+            `Authentication timed out. No callback received within ${formatAuthTimeout(_authTimeoutMs)}.`
+          )
+        );
+      }, _authTimeoutMs);
 
       server.on("request", (req: IncomingMessage, res: ServerResponse) => {
         const result = handleOAuthCallback(req, res, expectedState, port);
@@ -255,7 +285,12 @@ export function createAuthModule(deps?: AuthModuleDeps) {
     return persistRefreshedCredentials(credentials, tokenResponse);
   }
 
-  async function login(options?: { iamUrl?: string; clientId?: string }): Promise<AuthIdentity> {
+  async function login(options?: {
+    iamUrl?: string;
+    clientId?: string;
+    /** Set when the IAM URL was derived from --api-base: appended to timeout/connection/404 failures. */
+    derivedIamHint?: string;
+  }): Promise<AuthIdentity> {
     const iamUrl = options?.iamUrl || DEFAULT_IAM_URL;
     const clientId = options?.clientId || DEFAULT_CLIENT_ID;
 
@@ -311,18 +346,33 @@ export function createAuthModule(deps?: AuthModuleDeps) {
       // Browser open failed silently — user can open manually
     }
 
-    const callbackResult = await waitForCallback(callbackServer, boundPort, state);
+    const withDerivedHint = (error: unknown): unknown => {
+      if (!options?.derivedIamHint || !isIamUnreachableError(error)) return error;
+      const message = error instanceof Error ? error.message : String(error);
+      return new Error(`${message}\n${options.derivedIamHint}`, { cause: error });
+    };
 
-    callbackServer.close();
+    let tokenResponse: TokenResponse;
+    try {
+      let callbackResult: CallbackResult;
+      try {
+        callbackResult = await waitForCallback(callbackServer, boundPort, state);
+      } finally {
+        // Close on every outcome, including an OAuth error callback.
+        callbackServer.close();
+      }
 
-    const tokenResponse = await tokenClient.exchangeCode({
-      code: callbackResult.code,
-      redirectUri: callbackResult.redirectUri,
-      codeVerifier,
-      clientId,
-      iamUrl,
-      apiResource: DEFAULT_API_RESOURCE,
-    });
+      tokenResponse = await tokenClient.exchangeCode({
+        code: callbackResult.code,
+        redirectUri: callbackResult.redirectUri,
+        codeVerifier,
+        clientId,
+        iamUrl,
+        apiResource: DEFAULT_API_RESOURCE,
+      });
+    } catch (error) {
+      throw withDerivedHint(error);
+    }
 
     let profileEmail: string | undefined;
     let profileName: string | undefined;
@@ -417,6 +467,11 @@ export function createAuthModule(deps?: AuthModuleDeps) {
 
     credentials = await refreshCredentials(credentials, organizationId);
     return credentials.access_token;
+  }
+
+  /** Whether any login is stored locally. Reads the credentials file only (no network). */
+  async function hasStoredCredentials(): Promise<boolean> {
+    return (await store.load()) !== null;
   }
 
   async function getIdToken(): Promise<string | null> {
@@ -598,6 +653,7 @@ export function createAuthModule(deps?: AuthModuleDeps) {
     logout,
     getAccessToken,
     getIdToken,
+    hasStoredCredentials,
     whoami,
     requireDeveloperRole,
     requirePlatformAdmin,
@@ -615,6 +671,7 @@ export const {
   logout,
   getAccessToken,
   getIdToken,
+  hasStoredCredentials,
   whoami,
   requireDeveloperRole,
   requirePlatformAdmin,

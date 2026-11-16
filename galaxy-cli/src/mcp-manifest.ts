@@ -197,7 +197,7 @@ export function validateConnectorManifest(raw: unknown, opts?: { tsconfigPath?: 
   }
 }
 
-import { envForIsolatedDockerConfig } from "./docker-daemon-env.js";
+import { ensureDockerBuildx, envForIsolatedDockerConfig } from "./docker-daemon-env.js";
 import { GalaxyHttpClient, extractErrorDetail, withRequestId } from "./http-client.js";
 import { PERMISSION_TOOL_VALUES } from "./manifest.js";
 import { resolveTargetPlatform } from "./platform.js";
@@ -217,6 +217,9 @@ const McpToolSchema = z.object({
   description: z.string().max(500).optional(),
   keywords: z.array(z.string()).optional(),
   parameters: ToolParametersSchema,
+  // Read at import and activation (never weakening a stored write); tools that mcp-gateway
+  // discovery can't reach, such as caller-token-forwarding services, rely on it.
+  capability: z.enum(["read", "write", "read_write"]).optional(),
 });
 
 // Reuses the agent manifest's own capability enum (manifest.ts) rather than
@@ -457,6 +460,7 @@ function ensureDocker(): void {
         "If Docker is installed but not in PATH, set the DOCKER_HOST environment variable."
     );
   }
+  ensureDockerBuildx();
 }
 
 export function resolveDockerfile(manifestPath: string, dockerfileOverride?: string): string {

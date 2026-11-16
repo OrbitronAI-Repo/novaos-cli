@@ -21,6 +21,7 @@ import { assertNameIsNotPath, assertNoPathTraversal } from "./init-path.js";
 import { parseEnvLines } from "./mcp-manifest.js";
 import {
   extractServerHostnames,
+  assertValidRisks,
   initFromOpenApiSpec,
   parseOpenApiSpec,
   revalidateSsrfAllowedDomainsAtPublish,
@@ -99,6 +100,19 @@ export interface ConnectorInitOptions {
   directory?: string;
   /** Path to an OpenAPI 3.x spec file. When provided, triggers codegen mode. */
   spec?: string;
+  /** With `spec`: only generate operations whose path starts with one of these prefixes. */
+  includePaths?: string[];
+  /** With `spec`: only generate operations with these risk classes (read, write, destructive). */
+  includeRisks?: string[];
+}
+
+export interface ConnectorInitResult {
+  directory: string;
+  files: string[];
+  /** Operations the spec declared but the connector runtime cannot send. */
+  skipped?: Array<{ method: string; path: string; reason: string }>;
+  /** Review items from OpenAPI codegen (auth mapping, size, missing servers). */
+  warnings?: string[];
 }
 
 export interface ConnectorPublishOptions {
@@ -429,7 +443,7 @@ export async function connectorList(
   return finalResult;
 }
 
-export function connectorInit(opts: ConnectorInitOptions): { directory: string; files: string[] } {
+export function connectorInit(opts: ConnectorInitOptions): ConnectorInitResult {
   assertNameIsNotPath("connector", opts.name);
 
   // When --spec is provided, delegate to the OpenAPI codegen pipeline.
@@ -439,6 +453,8 @@ export function connectorInit(opts: ConnectorInitOptions): { directory: string; 
       publisher: opts.publisher,
       specPath: opts.spec,
       directory: opts.directory,
+      includePaths: opts.includePaths,
+      includeRisks: assertValidRisks(opts.includeRisks),
     });
   }
 

@@ -33,6 +33,20 @@ saying so.
 
 Node.js 18 or newer is required.
 
+## Quick start
+
+```bash
+novaos-cli auth login --env <env>
+novaos-cli init --name my-agent --lang python
+```
+
+`init` needs `--name`. The new project's `AGENTS.md` lists the next steps,
+from local tests to `novaos-cli publish manifest.json` and
+`novaos-cli publish-status <review-id> --wait`. Python agents use the SDK
+[`novaos-agent-sdk` on PyPI](https://pypi.org/project/novaos-agent-sdk/).
+To install and run a published agent, see
+[Installing and running a published agent](https://orbitronai-repo.github.io/novaos-agent-sdk/guides/installing-and-running/).
+
 ## Supported platforms
 
 | OS            | Architecture |

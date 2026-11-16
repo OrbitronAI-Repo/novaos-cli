@@ -52,6 +52,12 @@ export interface EnvironmentPreset extends EnvironmentUrls {
   serviceEnvironment?: ServiceEnvironmentTier;
   /** Where this preset's values came from — for provenance reporting (env show --verbose) only. */
   presetOrigin: "local" | "config-file";
+  /**
+   * True when `iamUrl` was not given in the config entry and was derived as
+   * `<apiBase>/iam`. Computed from the entry on every load (the config file
+   * stores only what the user gave), so older config files need no migration.
+   */
+  iamUrlDerived?: boolean;
 }
 
 /** Config-file shape for a single user-supplied named environment. */
@@ -170,7 +176,42 @@ export function buildPresetFromConfigEntry(
     marketplaceUrl: entry.marketplaceUrl,
     serviceEnvironment: entry.serviceEnvironment,
     presetOrigin: "config-file",
+    iamUrlDerived: !entry.iamUrl,
   };
+}
+
+/**
+ * The hint appended to a failed `auth login` when the IAM URL was derived from
+ * --api-base rather than given. A derived `<api-base>/iam` does not exist on
+ * every deployment, so a login that times out or can't connect there should
+ * say how to point the environment at the real identity issuer.
+ *
+ * `env add` replaces the whole entry, so the command carries the entry's other
+ * saved values (client ID, marketplace URL, tier, label) and says to keep any
+ * other flags; worded as a possibility, since a timeout can also mean the user
+ * simply did not finish signing in.
+ */
+export function describeDerivedIamFailure(
+  preset: Pick<
+    EnvironmentPreset,
+    "name" | "label" | "apiBase" | "iamUrl" | "clientId" | "marketplaceUrl" | "serviceEnvironment"
+  >
+): string {
+  const flags = [
+    `--api-base ${preset.apiBase}`,
+    "--iam-url <issuer-url>",
+    `--client-id ${preset.clientId}`,
+  ];
+  if (preset.marketplaceUrl) flags.push(`--marketplace-url ${preset.marketplaceUrl}`);
+  if (preset.serviceEnvironment) flags.push(`--service-environment ${preset.serviceEnvironment}`);
+  if (preset.label && preset.label !== preset.name)
+    flags.push(`--label ${JSON.stringify(preset.label)}`);
+  return (
+    `The IAM URL ${preset.iamUrl} was derived from --api-base and may not be this environment's ` +
+    `identity issuer. If so, re-add the environment with the issuer URL ` +
+    `(env add replaces the entry, so also repeat any other URL flags you gave it): ` +
+    `novaos-cli env add ${preset.name} ${flags.join(" ")}`
+  );
 }
 
 let cachedEnvironments: Record<string, EnvironmentPreset> | undefined;

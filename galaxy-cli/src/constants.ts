@@ -132,6 +132,15 @@ export const DEFAULT_RETRY_MODE = "standard" as const;
 export const DEFAULT_MAX_ATTEMPTS = 3;
 export const RETRY_BASE_DELAY_MS = 200;
 export const RETRY_MAX_DELAY_MS = 5_000;
+/**
+ * Longest Retry-After (seconds) the client waits out before retrying. The CLI
+ * is interactive, and with the default 3 attempts this keeps the worst case
+ * to ~20 s of waiting. A longer value means the next attempt would fail the
+ * same way (agent-ops sends 30 s on a Loki/Tempo 503 and up to its 60 s
+ * window on a rate-limit 429), so the client returns that response at once
+ * rather than spend more requests against a shared rate-limit bucket.
+ */
+export const MAX_RETRY_AFTER_S = 10;
 
 // ---- Platform Security Limits ----
 
@@ -147,18 +156,13 @@ export const PLATFORM_MAX_CPU_MILLICORES = 4000;
 // git vendoring.
 export const PYTHON_AGENT_SDK_PYPI_PACKAGE = "novaos-agent-sdk";
 
-// Pinned SDK version scaffolded into every new Python agent's requirements.txt.
-// Only the A2A version line is targeted; bump this when a new pinned version
-// should roll out to newly-scaffolded agents. Pinned to the highest version
-// actually published on the index above — verify a new value resolves there
-// before bumping it, since an unpublished pin breaks every fresh scaffold's
+// Version range scaffolded into every new Python agent's requirements.txt. The
+// lower bound is the oldest public release the scaffold is tested against; the
+// upper bound keeps new agents on the 2.x line. Raise the lower bound when a
+// newer release should become the default, and check that the new range
+// resolves on PyPI first — an unpublished range breaks every fresh scaffold's
 // `pip install`.
-export const PYTHON_AGENT_SDK_VERSION = "2.0.0rc1";
-
-// Package index the SDK is installed from. The SDK currently lives only on
-// TestPyPI — this is the single place that changes on the production PyPI
-// cutover (a separate, later piece of work owns making that switch).
-export const PYTHON_AGENT_SDK_PACKAGE_INDEX_URL = "https://test.pypi.org/simple/";
+export const PYTHON_AGENT_SDK_VERSION_SPEC = ">=2.1,<3";
 
 // ---- TypeScript agent SDK ----
 

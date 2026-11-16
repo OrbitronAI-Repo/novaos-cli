@@ -27,11 +27,12 @@ import semver from "semver";
 import { z } from "zod";
 
 import { REGISTRY_MAP } from "./constants.js";
-import { envForIsolatedDockerConfig } from "./docker-daemon-env.js";
+import { ensureDockerBuildx, envForIsolatedDockerConfig } from "./docker-daemon-env.js";
+import { type HostPython, resolveHostPython, sdkNotImportableMessage } from "./host-python.js";
 import { type GalaxyHttpClient, extractErrorDetail, withRequestId } from "./http-client.js";
 import { validateManifest } from "./manifest.js";
 import { resolveTargetPlatform } from "./platform.js";
-import { isPreCutoverIndex, PYTHON_SDK_PRE_CUTOVER_WARNING } from "./python-sdk-release.js";
+import { testPyPiRequirementFiles, testPyPiWarning } from "./python-sdk-release.js";
 
 export interface PublishOptions {
   manifestPath: string;
@@ -78,6 +79,7 @@ function ensureDocker(): void {
         "If Docker is installed but not in PATH, set the DOCKER_HOST environment variable."
     );
   }
+  ensureDockerBuildx();
 }
 
 function resolveDockerfile(manifestPath: string, dockerfileOverride?: string): string {
@@ -214,6 +216,8 @@ interface CardCapture {
   skills: AgentSkill[];
   capabilities: { streaming?: boolean };
   executedVia: CardCaptureSource;
+  /** The host interpreter, when `executedVia` is `"host"`. */
+  hostPython?: HostPython;
 }
 
 /** Node's `os.arch()` values, mapped onto the `linux/<arch>` suffix `docker buildx --platform` uses. */
@@ -357,12 +361,9 @@ const SDK_IMPORT_FAILURE_PATTERN = /No module named ['"]novaos_client_sdk['"]/;
  * the emitter subprocess produced. Every other emitter failure passes through
  * unchanged, so it still surfaces as before.
  */
-function translateSdkImportFailure(err: Error): Error {
+function translateSdkImportFailure(err: Error, hostPython?: HostPython): Error {
   if (!SDK_IMPORT_FAILURE_PATTERN.test(err.message)) return err;
-  return new SdkNotImportableError(
-    "novaos-agent-sdk is not installed or importable by the Agent Card emitter " +
-      `(${err.message}). Run: pip install --no-deps -r requirements-sdk.txt && pip install -r requirements.txt`
-  );
+  return new SdkNotImportableError(sdkNotImportableMessage(err.message, hostPython));
 }
 
 /** Resolve source imports independently of a potentially shared Docker build context. */
@@ -448,8 +449,9 @@ function runCaptureContainer(localImageRef: string, agentModule: string): Promis
  * publish latency (or reliability) on. Detected up front instead: on a match,
  * the emitter runs inside the image that was just built (the exact artifact
  * being published); on a mismatch, it falls back to running the emitter on
- * the host, against the source tree beside the manifest. The active Python
- * environment must provide the agent's dependencies.
+ * the host, against the source tree beside the manifest. The host Python is
+ * the active venv, else the project's `.venv`/`venv`, else `python3` on
+ * `PATH` (see `resolveHostPython`); it must provide the agent's dependencies.
  */
 export async function captureRuntimeCard(
   localImageRef: string,
@@ -460,18 +462,20 @@ export async function captureRuntimeCard(
 ): Promise<CardCapture> {
   const executedVia: CardCaptureSource =
     platformArch(targetPlatform) === hostDockerArch() ? "image" : "host";
+  const hostPython =
+    executedVia === "host" ? resolveHostPython([manifestDir, contextDir]) : undefined;
 
   let stdout: string;
   try {
-    stdout =
-      executedVia === "image"
-        ? await runCaptureContainer(localImageRef, agentModule)
-        : await runCapturingStdout("python3", ["-m", "novaos_client_sdk.agent_card", agentModule], {
-            cwd: manifestDir,
-            env: hostCaptureEnv(contextDir, manifestDir),
-          });
+    stdout = hostPython
+      ? await runCapturingStdout(
+          hostPython.command,
+          ["-m", "novaos_client_sdk.agent_card", agentModule],
+          { cwd: manifestDir, env: hostCaptureEnv(contextDir, manifestDir) }
+        )
+      : await runCaptureContainer(localImageRef, agentModule);
   } catch (err) {
-    throw translateSdkImportFailure(err as Error);
+    throw translateSdkImportFailure(err as Error, hostPython);
   }
 
   let parsed: unknown;
@@ -489,7 +493,7 @@ export async function captureRuntimeCard(
       `Agent Card emitter (${executedVia}) returned an invalid runtime card: ${result.error.message}`
     );
   }
-  return { ...result.data, executedVia };
+  return { ...result.data, executedVia, ...(hostPython ? { hostPython } : {}) };
 }
 
 export async function agentPublish(client: GalaxyHttpClient, opts: PublishOptions): Promise<void> {
@@ -551,19 +555,21 @@ export async function agentPublish(client: GalaxyHttpClient, opts: PublishOption
   if (!json)
     stderr(`ok (${manifest.name} v${manifest.version}, publisher: ${manifest.publisher})\n`);
 
-  if (!json && validationResult.warnings?.length) {
+  // Warnings go to stderr even with --json: they are findings, not progress,
+  // and stderr never mixes with the JSON on stdout.
+  if (validationResult.warnings?.length) {
     for (const w of validationResult.warnings) {
       stderr(`  Warning: ${w}\n`);
     }
   }
 
-  // TestPyPI → production PyPI cutover gate: a Python agent depends on
-  // novaos-agent-sdk, which currently has no production PyPI release.
-  // Written to stderr unconditionally (even with --json, which only
+  // An agent scaffolded before the SDK reached PyPI still installs it from
+  // TestPyPI. Written to stderr unconditionally (even with --json, which only
   // suppresses human progress narration on stdout) since this is a
   // production-deployability warning, not progress.
-  if (manifest.language === "python" && isPreCutoverIndex()) {
-    stderr(PYTHON_SDK_PRE_CUTOVER_WARNING);
+  if (manifest.language === "python") {
+    const testPyPiFiles = testPyPiRequirementFiles(path.dirname(path.resolve(manifestPath)));
+    if (testPyPiFiles.length > 0) stderr(testPyPiWarning(testPyPiFiles));
   }
 
   // Step 3: Resolve Dockerfile and build context
@@ -658,7 +664,12 @@ export async function agentPublish(client: GalaxyHttpClient, opts: PublishOption
     agentCardSource = capture.executedVia;
     runtimeSkills = capture.skills;
     runtimeStreaming = capture.capabilities.streaming;
-    if (!json) stderr(`ok (via ${capture.executedVia})\n`);
+    if (!json) {
+      const via = capture.hostPython
+        ? `${capture.executedVia}, ${capture.hostPython.label}`
+        : capture.executedVia;
+      stderr(`ok (via ${via})\n`);
+    }
   } catch (err) {
     if (err instanceof SdkNotImportableError && manifest.language === "python") {
       if (!json) stderr("failed\n");
@@ -775,14 +786,21 @@ export async function agentPublish(client: GalaxyHttpClient, opts: PublishOption
   if (json) {
     process.stdout.write(
       JSON.stringify(
-        { ...result, agent_card_source: agentCardSource, agent_card_attached: agentCardAttached },
+        {
+          ...result,
+          agent_uuid: authData.agent_uuid,
+          agent_card_source: agentCardSource,
+          agent_card_attached: agentCardAttached,
+        },
         null,
         2
       ) + "\n"
     );
   } else {
     stderr(`\nPublished! Review ID: ${result.review_id}\n`);
+    stderr(`  Agent ID: ${authData.agent_uuid}\n`);
     stderr(`  Status: ${result.status}\n`);
     stderr(`  Image:  ${result.image_ref}\n`);
+    stderr(`\nNext: novaos-cli publish-status ${result.review_id} --wait\n`);
   }
 }

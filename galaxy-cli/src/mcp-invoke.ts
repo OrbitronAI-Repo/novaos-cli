@@ -1,8 +1,10 @@
 /**
  * novaos-cli — MCP Tool Invocation
  *
- * Provides `novaos-cli mcp invoke` to call an MCP tool via the sandbox gateway
- * using the JSON-RPC 2.0 protocol.
+ * Provides `novaos-cli mcp invoke` to call an MCP tool via the local sandbox
+ * gateway using the JSON-RPC 2.0 protocol. Deployed gateways are cluster-internal
+ * and authenticate execution tokens minted by the platform, so this command is
+ * not meant for them.
  */
 
 // ---------------------------------------------------------------------------
@@ -97,7 +99,8 @@ export async function mcpInvoke(options: McpInvokeOptions): Promise<{ exitCode: 
   const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(gatewayUrl);
   if (!isLocalhost && !options.token) {
     process.stderr.write(
-      `Warning: targeting non-localhost gateway without --token. The request may be rejected.\n`
+      `Warning: ${gatewayUrl} is not a local address. mcp invoke is for the local sandbox gateway; ` +
+        `a deployed gateway accepts only platform-issued execution tokens, which this command does not send, so the request is likely to be rejected.\n`
     );
   }
 

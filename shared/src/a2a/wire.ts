@@ -1084,20 +1084,27 @@ export function tryExtractNovaosMetadata(part: InboundPart, out: NovaosPartExtra
   // report it as one so the caller suppresses it, but there is nothing to read.
   if (!record || typeof record !== "object" || Array.isArray(record)) return true;
 
-  const hitl = record[NOVAOS_PAUSE_KEYS.HITL];
-  if (hitl && typeof hitl === "object" && !Array.isArray(hitl)) {
-    const h = hitl as Record<string, unknown>;
-    out.hitlRequest = {
-      type: "input",
-      prompt: firstString(h.content, h.message, h.prompt) ?? "Agent needs input",
-      metadata: h,
-    };
-  }
+  const hitlRequest = hitlRequestFromRecord(record);
+  if (hitlRequest) out.hitlRequest = hitlRequest;
 
   extractPausePayloads(record, out);
 
   out.metadata = { ...(out.metadata ?? {}), ...record };
   return true;
+}
+
+/** The HITL pause a metadata record's `hitl` key describes, if it has one. */
+function hitlRequestFromRecord(
+  record: Record<string, unknown>
+): NovaosPartExtract["hitlRequest"] | undefined {
+  const hitl = record[NOVAOS_PAUSE_KEYS.HITL];
+  if (!hitl || typeof hitl !== "object" || Array.isArray(hitl)) return undefined;
+  const h = hitl as Record<string, unknown>;
+  return {
+    type: "input",
+    prompt: firstString(h.content, h.message, h.prompt) ?? "Agent needs input",
+    metadata: h,
+  };
 }
 
 const asRecord = (value: unknown): Record<string, unknown> | undefined =>
@@ -1322,6 +1329,12 @@ export function drainParts(
         const record = part.data as Record<string, unknown>;
         data.push(record);
         extractPausePayloads(record, extract);
+        // `SkillResult(metadata={"hitl": ...})` asks for a decision with
+        // buttons; a pause the platform marker already carries wins.
+        if (!extract.hitlRequest) {
+          const hitlRequest = hitlRequestFromRecord(record);
+          if (hitlRequest) extract.hitlRequest = hitlRequest;
+        }
       }
       continue;
     }

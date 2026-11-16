@@ -5,6 +5,8 @@
  * This file is the single source of truth; gateway and temporal-worker import from here.
  */
 
+import type { PinnedCheckDeclaration } from "../a2a/check-config-resolver.js";
+
 export interface AgentResourceOverrides {
   /** Memory in megabytes (maps to K8s resource limits). */
   memoryMb?: number;
@@ -50,6 +52,14 @@ export interface ResolvedAgent {
    */
   memoryDeclared?: boolean;
   /**
+   * The agent's pinned check declaration from the catalog manifest's
+   * `in_run_check` block (`checkDeclarationFromManifest` in the shared a2a
+   * module). Holds references only; the dispatch activities resolve the rubric
+   * texts from it. Unset when the manifest declares no check, has no catalog
+   * row, or the catalog lookup failed.
+   */
+  inRunCheck?: PinnedCheckDeclaration;
+  /**
    * True when the catalog manifest sets `audit.action_tracking_enabled`
    * (`manifestHasActionTrackingEnabled` in the shared audit module),
    * read from the raw row for the same reason as `memoryDeclared`. Used by
@@ -63,4 +73,11 @@ export interface ResolvedAgent {
    * Gateway can limit the agent to them; undefined = none declared (no restriction).
    */
   mcpServers?: string[];
+  /**
+   * True when the catalog manifest sets `resumable: true` (`manifestIsResumable` in the shared
+   * manifest predicates). The agent saves and resumes through the SDK, so a paused or cut-off
+   * run can continue on another pod. Unset when the manifest does not declare it, has no catalog
+   * row, or the catalog lookup failed.
+   */
+  resumable?: boolean;
 }

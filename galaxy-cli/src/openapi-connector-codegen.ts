@@ -13,6 +13,7 @@
  * if any server URL resolves to a forbidden CIDR or wildcard.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -33,6 +34,9 @@ const GENERATED_BLOCK_END = "// @generated:end";
 
 const MANIFEST_FILENAME = "connector.json";
 
+/** Longest operation slug (and therefore file name) the generator emits. */
+const MAX_SLUG_LENGTH = 64;
+
 // ---------------------------------------------------------------------------
 // OpenAPI types (minimal subset for codegen)
 // ---------------------------------------------------------------------------
@@ -40,6 +44,21 @@ const MANIFEST_FILENAME = "connector.json";
 interface OpenApiServer {
   url: string;
   description?: string;
+  variables?: Record<string, { default?: string }>;
+}
+
+interface OpenApiSecurityScheme {
+  type?: string;
+  scheme?: string;
+  in?: string;
+  name?: string;
+  flows?: {
+    authorizationCode?: {
+      authorizationUrl?: string;
+      tokenUrl?: string;
+      scopes?: Record<string, string>;
+    };
+  };
 }
 
 interface OpenApiSchema {
@@ -62,6 +81,7 @@ interface OpenApiParameter {
 
 interface OpenApiRequestBody {
   description?: string;
+  required?: boolean;
   content?: Record<string, { schema?: OpenApiSchema }>;
 }
 
@@ -78,6 +98,7 @@ interface OpenApiOperation {
   requestBody?: OpenApiRequestBody;
   responses?: Record<string, OpenApiResponse>;
   tags?: string[];
+  security?: Array<Record<string, string[]>>;
 }
 
 interface OpenApiPathItem {
@@ -95,17 +116,25 @@ interface OpenApiDocument {
     title: string;
     version: string;
     description?: string;
+    termsOfService?: string;
+    license?: { name?: string; url?: string };
   };
   servers?: OpenApiServer[];
   paths?: Record<string, OpenApiPathItem>;
+  components?: { securitySchemes?: Record<string, unknown> } & Record<string, unknown>;
+  security?: Array<Record<string, string[]>>;
 }
 
 // ---------------------------------------------------------------------------
 // Connector manifest types
 // ---------------------------------------------------------------------------
 
+export type OperationRisk = "read" | "write" | "destructive";
+
 export interface ConnectorOperationDef {
   description?: string;
+  /** Read by connector-host: `destructive` operations are refused without a bound human approval. */
+  risk?: OperationRisk;
   requestSchema?: Record<string, unknown>;
   responseSchema?: Record<string, unknown>;
 }
@@ -152,6 +181,13 @@ export function parseOpenApiSpec(specPath: string): OpenApiDocument {
   }
 
   const doc = raw as Record<string, unknown>;
+
+  if (typeof doc["swagger"] === "string") {
+    throw new Error(
+      `OpenAPI spec "${resolvedPath}" is Swagger ${doc["swagger"]}; only OpenAPI 3.x is supported. ` +
+        `Convert it first, for example: npx swagger2openapi <file> -o openapi3.json`
+    );
+  }
 
   if (typeof doc["openapi"] !== "string" || !doc["openapi"].startsWith("3.")) {
     throw new Error(
@@ -207,21 +243,33 @@ export function extractServerHostnames(servers: OpenApiServer[]): string[] {
  *   2. `{httpMethod}-{path-normalized}` (path params stripped)
  */
 export function deriveOperationSlug(method: string, urlPath: string, operationId?: string): string {
+  let slug: string;
   if (operationId && operationId.trim()) {
     // Lowercase and replace non-alphanumeric runs with hyphens
-    return operationId
+    slug = operationId
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "");
+  } else {
+    // Normalize path: remove leading slash, replace / and {} chars with hyphen
+    const normalizedPath = urlPath
+      .replace(/^\//, "")
+      .replace(/\{[^}]+\}/g, "param")
+      .replace(/[^a-z0-9]+/gi, "-")
+      .toLowerCase()
+      .replace(/^-|-$/g, "");
+    slug = `${method.toLowerCase()}-${normalizedPath || "root"}`;
   }
-  // Normalize path: remove leading slash, replace / and {} chars with hyphen
-  const normalizedPath = urlPath
-    .replace(/^\//, "")
-    .replace(/\{[^}]+\}/g, "param")
-    .replace(/[^a-z0-9]+/gi, "-")
-    .toLowerCase()
-    .replace(/^-|-$/g, "");
-  return `${method.toLowerCase()}-${normalizedPath || "root"}`;
+  if (!slug) {
+    slug = "operation";
+  }
+  // Operation keys and file names must stay short. Truncate deterministically,
+  // keeping a hash of the full slug so distinct long names do not collide.
+  if (slug.length > MAX_SLUG_LENGTH) {
+    const hash = createHash("sha1").update(slug).digest("hex").slice(0, 8);
+    slug = `${slug.slice(0, MAX_SLUG_LENGTH - 9).replace(/-$/, "")}-${hash}`;
+  }
+  return slug;
 }
 
 /**
@@ -240,37 +288,167 @@ export function slugToPascalCase(slug: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// $ref resolution
+// ---------------------------------------------------------------------------
+
+/** Maximum nesting of distinct `$ref` expansions along one path. */
+const MAX_REF_DEPTH = 2;
+/** Maximum schema objects expanded per operation before further refs collapse. */
+const MAX_SCHEMA_NODES = 200;
+/** Deepest `properties`/`items` nesting kept in an inlined schema. */
+const MAX_SCHEMA_LEVEL = 3;
+const DROPPED_SCHEMA_KEYS = new Set([
+  "discriminator",
+  "example",
+  "examples",
+  "externalDocs",
+  "xml",
+]);
+const COMPOSITE_KEYS = ["properties", "items", "allOf", "anyOf", "oneOf"];
+/** Longest `description` kept on an inlined schema node. */
+const MAX_SCHEMA_DESCRIPTION = 200;
+
+interface RefBudget {
+  nodes: number;
+}
+
+function resolvePointer(doc: unknown, ref: string): unknown {
+  if (!ref.startsWith("#/")) {
+    return undefined;
+  }
+  let cur: unknown = doc;
+  for (const raw of ref.slice(2).split("/")) {
+    let seg: string;
+    try {
+      seg = decodeURIComponent(raw);
+    } catch {
+      return undefined;
+    }
+    seg = seg.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (typeof cur !== "object" || cur === null) {
+      return undefined;
+    }
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/**
+ * Inline local `$ref`s. Real-world specs (Slack, Microsoft Graph) are almost
+ * entirely `$ref`-based, and the connector manifest cannot carry `#/components`
+ * pointers because it is a standalone document. Recursive or very deep
+ * references collapse to an opaque object instead of expanding forever.
+ */
+function deref(
+  node: unknown,
+  doc: unknown,
+  stack: string[],
+  budget: RefBudget,
+  level = 0
+): unknown {
+  if (Array.isArray(node)) {
+    return node.map((n) => deref(n, doc, stack, budget, level));
+  }
+  if (node === null || typeof node !== "object") {
+    return node;
+  }
+  const obj = node as Record<string, unknown>;
+  const ref = obj["$ref"];
+  if (typeof ref === "string") {
+    const target = resolvePointer(doc, ref);
+    if (
+      target === undefined ||
+      stack.includes(ref) ||
+      stack.length >= MAX_REF_DEPTH ||
+      budget.nodes >= MAX_SCHEMA_NODES
+    ) {
+      budget.nodes++;
+      return { type: "object" };
+    }
+    return deref(target, doc, [...stack, ref], budget, level);
+  }
+  // Below this property/items nesting depth, composite schemas collapse to their type.
+  if (level > MAX_SCHEMA_LEVEL && COMPOSITE_KEYS.some((key) => key in obj)) {
+    budget.nodes++;
+    return { type: typeof obj["type"] === "string" ? obj["type"] : "object" };
+  }
+  budget.nodes++;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    // Not needed to call the API, and `discriminator.mapping` alone can list hundreds of
+    // `#/components/...` pointers that mean nothing outside the source document.
+    if (DROPPED_SCHEMA_KEYS.has(k) || k.startsWith("x-")) {
+      continue;
+    }
+    // Far past the budget, stop listing further properties altogether so a single
+    // huge schema (Microsoft Graph entities have hundreds) cannot dominate the manifest.
+    if (k === "properties" && budget.nodes >= MAX_SCHEMA_NODES * 2) {
+      continue;
+    }
+    out[k] =
+      k === "description" && typeof v === "string" && v.length > MAX_SCHEMA_DESCRIPTION
+        ? `${v.slice(0, MAX_SCHEMA_DESCRIPTION - 1)}…`
+        : deref(v, doc, stack, budget, k === "properties" || k === "items" ? level + 1 : level);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Schema extraction
 // ---------------------------------------------------------------------------
 
+type BodyKind = "json" | "form";
+
+/** Pick the request body encoding the generated code can actually send. */
+function pickBody(
+  requestBody: OpenApiRequestBody | undefined
+): { kind: BodyKind; schema?: OpenApiSchema } | "unsupported" | undefined {
+  if (!requestBody) {
+    return undefined;
+  }
+  const content = requestBody.content;
+  if (!content || Object.keys(content).length === 0) {
+    return { kind: "json" };
+  }
+  const entries = Object.entries(content);
+  const json = entries.find(([ct]) => /^application\/(.+\+)?json\b/i.test(ct));
+  if (json) {
+    return { kind: "json", schema: json[1].schema };
+  }
+  const form = entries.find(([ct]) => /^application\/x-www-form-urlencoded\b/i.test(ct));
+  if (form) {
+    return { kind: "form", schema: form[1].schema };
+  }
+  return "unsupported";
+}
+
 /**
- * Extract a JSON Schema from parameters and optional requestBody.
- * Only path, query, and header parameters are included in the request schema.
+ * Build a JSON Schema for the operation input from parameters and the request
+ * body. Path, query and header parameters become top-level properties; the
+ * request body is nested under `body`. Cookie parameters are not supported.
  */
 function buildRequestSchema(
-  parameters: OpenApiParameter[] | undefined,
-  requestBody: OpenApiRequestBody | undefined
+  parameters: OpenApiParameter[],
+  body: { schema?: OpenApiSchema } | undefined,
+  bodyRequired: boolean
 ): Record<string, unknown> {
   const properties: Record<string, unknown> = {};
   const required: string[] = [];
 
-  for (const param of parameters ?? []) {
-    if (!param.name) continue;
+  for (const param of parameters) {
+    if (param.in === "cookie") continue;
     properties[param.name] = {
       ...(param.schema ?? { type: "string" }),
-      description: param.description,
+      ...(param.description ? { description: param.description } : {}),
     };
-    if (param.required) {
+    if (param.required || param.in === "path") {
       required.push(param.name);
     }
   }
 
-  if (requestBody?.content) {
-    const jsonContent =
-      requestBody.content["application/json"] ?? Object.values(requestBody.content)[0];
-    if (jsonContent?.schema) {
-      properties["body"] = jsonContent.schema;
-    }
+  if (body?.schema) {
+    properties["body"] = body.schema;
+    if (bodyRequired) required.push("body");
   }
 
   const schema: Record<string, unknown> = { type: "object", properties };
@@ -306,11 +484,29 @@ export interface ParsedOperation {
   pathParams: string[];
   /** Names of parameters with `in: "query"` — appended as ?key=value. */
   queryParams: string[];
+  /** Names of parameters with `in: "header"` — sent as request headers. */
+  headerParams: string[];
+  /** Names that must be present in the input. */
+  requiredParams: string[];
   /** Whether the operation has a request body (POST/PUT/PATCH). */
   hasBody: boolean;
+  /** How the request body is encoded on the wire. */
+  bodyKind: BodyKind | undefined;
   description?: string;
+  /** Derived from the HTTP method and operation name; see `classifyRisk`. */
+  risk: OperationRisk;
   requestSchema: Record<string, unknown>;
   responseSchema?: Record<string, unknown>;
+  /** Names of security schemes this operation lists (operation-level, else document-level). */
+  securitySchemes: string[];
+  /** OAuth scopes per security scheme, taken from the operation's security requirement. */
+  securityScopes: Record<string, string[]>;
+}
+
+export interface SkippedOperation {
+  method: string;
+  path: string;
+  reason: string;
 }
 
 /**
@@ -330,47 +526,498 @@ function mergeParameters(
   return [...base.filter((p) => !overrideKeys.has(`${p.name}::${p.in}`)), ...overrides];
 }
 
+export interface ExtractOptions {
+  /**
+   * Keep only operations whose spec path starts with one of these prefixes
+   * (for example `/me/messages`). Large specs such as Microsoft Graph must be
+   * narrowed to the surface a connector actually needs.
+   */
+  includePaths?: string[];
+  /**
+   * Keep only operations with one of these risk classes (see `classifyRisk`).
+   * `["read"]` yields a read-only connector; `["write", "destructive"]` its
+   * companion. Splitting one API into several narrow connectors keeps approval
+   * and OAuth scopes small, because both follow the operations that are kept.
+   */
+  includeRisks?: OperationRisk[];
+}
+
+const OPERATION_RISKS: readonly OperationRisk[] = ["read", "write", "destructive"];
+
+/** Reject unknown risk names early; a typo must not silently generate everything. */
+export function assertValidRisks(
+  risks: readonly string[] | undefined
+): OperationRisk[] | undefined {
+  if (!risks || risks.length === 0) return undefined;
+  const unknown = risks.filter((r) => !(OPERATION_RISKS as readonly string[]).includes(r));
+  if (unknown.length > 0) {
+    throw new Error(
+      `Unknown risk "${unknown.join('", "')}". Use one or more of: ${OPERATION_RISKS.join(", ")}.`
+    );
+  }
+  return [...new Set(risks as OperationRisk[])];
+}
+
+/** Placeholder names in a path template, in order: `/a/{x}/b/{y}` → `["x", "y"]`. */
+function pathTemplateParams(urlPath: string): string[] {
+  return [...urlPath.matchAll(/\{([^}]+)\}/g)].map((m) => m[1] as string);
+}
+
+/** Parameter names that carry credentials in practice, whatever the spec's security block says. */
+const CREDENTIAL_PARAM_NAMES = new Set([
+  "authorization",
+  "token",
+  "access_token",
+  "api_key",
+  "apikey",
+  "x-api-key",
+]);
+
+/**
+ * Credentials must come from the connector's credential classes (resolved by
+ * connector-host and exposed as `ctx.credentials`), never from tool input —
+ * otherwise an agent would have to see and pass the secret itself. Specs such
+ * as Slack's declare a required `token` header on nearly every operation, so
+ * those parameters are dropped from the generated input schema.
+ */
+function credentialParamNames(spec: OpenApiDocument): Set<string> {
+  const names = new Set(CREDENTIAL_PARAM_NAMES);
+  for (const scheme of Object.values(spec.components?.securitySchemes ?? {})) {
+    const sch = scheme as OpenApiSecurityScheme | undefined;
+    if (sch?.type === "apiKey" && typeof sch.name === "string") {
+      names.add(sch.name.toLowerCase());
+    }
+  }
+  return names;
+}
+
+function asParameters(list: unknown): OpenApiParameter[] {
+  if (!Array.isArray(list)) return [];
+  return list.filter(
+    (p): p is OpenApiParameter =>
+      typeof p === "object" &&
+      p !== null &&
+      typeof (p as OpenApiParameter).name === "string" &&
+      typeof (p as OpenApiParameter).in === "string"
+  );
+}
+
+/**
+ * Breadth score for one OAuth scope: lower is narrower. Used only to choose
+ * between alternatives that each suffice on their own.
+ */
+function scopeBreadth(scope: string): number {
+  // Workspace add-on scopes are only grantable to add-ons, not to ordinary OAuth apps,
+  // so they must lose to any regular alternative.
+  if (/\.addons\./.test(scope)) return 2;
+  if (/(^|[._:/-])(readonly|read-only|read)$/i.test(scope)) return 0;
+  // Provider-wide grants such as ".../auth/drive", ".../auth/calendar" or "https://mail.google.com/".
+  try {
+    const url = new URL(scope);
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length === 0) return 3;
+    if (segments.length === 2 && segments[0] === "auth" && !segments[1]!.includes(".")) return 3;
+  } catch {
+    // Not a URL scope (e.g. "chat:write"): an ordinary scope.
+    return 1;
+  }
+  return 1;
+}
+
+function requirementBreadth(scopes: string[]): number {
+  return scopes.reduce((sum, s) => sum + scopeBreadth(s), 0) + scopes.length * 0.001;
+}
+
+/**
+ * Read an OpenAPI security requirement list into the schemes an operation uses
+ * and, per scheme, the scopes to request.
+ *
+ * Several requirement objects are ALTERNATIVES (any one suffices); the scopes
+ * inside one object are all required together. Google's specs list many
+ * alternatives per operation, so taking a union would request the broadest
+ * grants (full Drive, full mailbox). Instead the narrowest alternative is
+ * chosen for each scheme.
+ */
+function readSecurityRequirement(
+  security: Array<Record<string, string[]>> | undefined
+): Pick<ParsedOperation, "securitySchemes" | "securityScopes"> {
+  const securitySchemes: string[] = [];
+  const securityScopes: Record<string, string[]> = {};
+  for (const requirement of security ?? []) {
+    for (const [scheme, rawScopes] of Object.entries(requirement)) {
+      if (!securitySchemes.includes(scheme)) securitySchemes.push(scheme);
+      const scopes = Array.isArray(rawScopes) ? [...rawScopes].sort() : [];
+      const current = securityScopes[scheme];
+      if (current === undefined || requirementBreadth(scopes) < requirementBreadth(current)) {
+        securityScopes[scheme] = scopes;
+      }
+    }
+  }
+  return { securitySchemes, securityScopes };
+}
+
 /**
  * Extract all operations from an OpenAPI document.
  *
  * Path-item level parameters (OpenAPI §4.8.9) are merged with operation-level
  * parameters so that shared parameters (e.g. a path `{id}` defined once on
  * the path item) are correctly reflected in the generated URL interpolation
- * and request schema.
+ * and request schema. Local `$ref`s are inlined. Operations whose request body
+ * the connector runtime cannot send (multipart, binary) are reported in
+ * `skipped` instead of being generated.
  */
-export function extractOperations(spec: OpenApiDocument): ParsedOperation[] {
+export function extractOperationsDetailed(
+  spec: OpenApiDocument,
+  opts: ExtractOptions = {}
+): { operations: ParsedOperation[]; skipped: SkippedOperation[] } {
   const ops: ParsedOperation[] = [];
+  const skipped: SkippedOperation[] = [];
   const HTTP_METHODS = ["get", "post", "put", "patch", "delete"] as const;
+  const prefixes = (opts.includePaths ?? []).filter((p) => p.length > 0);
+  const risks = assertValidRisks(opts.includeRisks);
+  const usedSlugs = new Set<string>();
+  const credentialNames = credentialParamNames(spec);
 
-  for (const [urlPath, pathItem] of Object.entries(spec.paths ?? {})) {
-    const pathItemParams = pathItem.parameters;
+  for (const [urlPath, rawPathItem] of Object.entries(spec.paths ?? {})) {
+    if (prefixes.length > 0 && !prefixes.some((p) => urlPath.startsWith(p))) {
+      continue;
+    }
+    // Only the path item itself is resolved here; each operation is expanded below
+    // with its own budget so one heavy operation cannot starve or bloat the others.
+    const pathItem = (
+      typeof (rawPathItem as { $ref?: unknown }).$ref === "string"
+        ? deref(rawPathItem, spec, [], { nodes: 0 })
+        : rawPathItem
+    ) as OpenApiPathItem;
+    const pathItemParams = asParameters(deref(pathItem.parameters, spec, [], { nodes: 0 }));
 
     for (const method of HTTP_METHODS) {
       const operation: OpenApiOperation | undefined = pathItem[method];
       if (!operation) continue;
 
-      const slug = deriveOperationSlug(method, urlPath, operation.operationId);
-      const camelName = slugToCamelCase(slug);
+      const budget: RefBudget = { nodes: 0 };
+      const resolved = deref(operation, spec, [], budget) as OpenApiOperation;
+      const mergedParams = mergeParameters(
+        pathItemParams,
+        asParameters(resolved.parameters)
+      ).filter((p) => p.in === "path" || !credentialNames.has(p.name.toLowerCase()));
 
-      // Merge path-item parameters (shared) with operation parameters (specific)
-      const mergedParams = mergeParameters(pathItemParams, operation.parameters);
+      const risk = classifyRisk(method, urlPath, resolved.operationId);
+      if (risks && !risks.includes(risk)) {
+        continue;
+      }
+
+      const body = pickBody(resolved.requestBody);
+      if (body === "unsupported") {
+        skipped.push({
+          method: method.toUpperCase(),
+          path: urlPath,
+          reason: "request body is neither JSON nor form-urlencoded (multipart/binary unsupported)",
+        });
+        continue;
+      }
+
+      let slug = deriveOperationSlug(method, urlPath, resolved.operationId);
+      if (usedSlugs.has(slug)) {
+        let n = 2;
+        while (usedSlugs.has(`${slug}-${n}`)) n++;
+        slug = `${slug}-${n}`;
+      }
+      usedSlugs.add(slug);
+
+      const templateParams = pathTemplateParams(urlPath);
+      const requestSchema = buildRequestSchema(
+        mergedParams,
+        body,
+        resolved.requestBody?.required === true
+      );
+      const requiredParams = [
+        ...new Set([
+          ...templateParams,
+          ...((requestSchema["required"] as string[] | undefined) ?? []),
+        ]),
+      ];
 
       ops.push({
         slug,
-        camelName,
+        camelName: toIdentifier(slugToCamelCase(slug)),
         method: method.toUpperCase(),
         path: urlPath,
-        pathParams: mergedParams.filter((p) => p.in === "path").map((p) => p.name),
+        pathParams: templateParams,
         queryParams: mergedParams.filter((p) => p.in === "query").map((p) => p.name),
-        hasBody: !!operation.requestBody,
-        description: operation.summary ?? operation.description,
-        requestSchema: buildRequestSchema(mergedParams, operation.requestBody),
-        responseSchema: buildResponseSchema(operation.responses) ?? undefined,
+        headerParams: mergedParams
+          .filter((p) => p.in === "header" && !RESERVED_HEADERS.has(p.name.toLowerCase()))
+          .map((p) => p.name),
+        requiredParams,
+        hasBody: body !== undefined,
+        bodyKind: body?.kind,
+        description: resolved.summary ?? resolved.description,
+        risk,
+        requestSchema,
+        responseSchema: buildResponseSchema(resolved.responses) ?? undefined,
+        ...readSecurityRequirement(resolved.security ?? spec.security),
       });
     }
   }
 
-  return ops;
+  return { operations: ops, skipped };
+}
+
+const DESTRUCTIVE_WORDS = new Set([
+  "delete",
+  "remove",
+  "destroy",
+  "purge",
+  "erase",
+  "wipe",
+  "revoke",
+  "terminate",
+  "trash",
+  "empty",
+]);
+
+/**
+ * Classify an operation for connector-host's approval gate. Anything that
+ * changes data is at least `write`; DELETE, and anything whose name says it
+ * deletes, is `destructive` (the host refuses those without a bound human
+ * approval). The check errs toward destructive: a read-looking name never
+ * downgrades a mutating method, and a POST named `batchDelete` is gated.
+ */
+export function classifyRisk(method: string, urlPath: string, operationId?: string): OperationRisk {
+  const m = method.toUpperCase();
+  if (m === "GET" || m === "HEAD") return "read";
+  if (m === "DELETE") return "destructive";
+  const words = `${operationId ?? ""} ${urlPath}`
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/);
+  return words.some((w) => DESTRUCTIVE_WORDS.has(w)) ? "destructive" : "write";
+}
+
+/** Headers the generated code controls itself; spec-declared copies are ignored. */
+const RESERVED_HEADERS = new Set(["authorization", "content-type", "accept"]);
+
+export function extractOperations(
+  spec: OpenApiDocument,
+  opts: ExtractOptions = {}
+): ParsedOperation[] {
+  return extractOperationsDetailed(spec, opts).operations;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication (NovaOS credential classes)
+// ---------------------------------------------------------------------------
+//
+// connector-host resolves credentials per invocation, highest priority first:
+//   Class 3 — per-user OAuth token        → ctx.credentials.accessToken
+//   Class 2 — tenant-wide credential      → ctx.credentials.<credentials_schema field>
+//   Class 1 — platform-owned              → 1a: OAuth client id/secret, used only for
+//                                              token exchange/refresh, NEVER given to
+//                                              operation code; 1b: platform API key.
+// Generated operations therefore read `accessToken` first and `apiKey` second,
+// and never embed or reference secrets. The manifest only carries the *names* of
+// the Class 1a env vars (T-CONN-002), exactly like the hand-written connectors.
+
+export interface ApiKeyAuth {
+  /** "bearer" → `Authorization: Bearer <key>`; "header"/"query" → named location. */
+  style: "bearer" | "header" | "query";
+  name?: string;
+}
+
+export interface OAuthAuth {
+  authorizationUrl: string;
+  tokenUrl: string;
+  scopes: string[];
+}
+
+export interface AuthPlan {
+  /** Class 3 support — present when the spec declares an authorization-code OAuth flow. */
+  oauth?: OAuthAuth;
+  /** Class 2 support — static key/token. Defaults to a bearer token when the spec says nothing. */
+  apiKey?: ApiKeyAuth;
+  /** Class 2 HTTP Basic (username + password). Used only when no bearer/API-key scheme exists. */
+  basic?: boolean;
+  warnings: string[];
+}
+
+function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const u = new URL(value);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Derive the credential classes a connector supports from the spec's
+ * `securitySchemes`. With no usable scheme the legacy default applies: a bearer
+ * token that may arrive as either an OAuth access token or a tenant API key.
+ */
+export function analyzeAuth(spec: OpenApiDocument, operations: ParsedOperation[]): AuthPlan {
+  const warnings: string[] = [];
+  const schemes = spec.components?.securitySchemes ?? {};
+  const referenced = new Set<string>();
+  for (const op of operations) for (const s of op.securitySchemes) referenced.add(s);
+  const names = referenced.size > 0 ? [...referenced] : Object.keys(schemes);
+
+  const plan: AuthPlan = { warnings };
+  for (const name of names) {
+    const scheme = deref(schemes[name], spec, [], { nodes: 0 }) as
+      | OpenApiSecurityScheme
+      | undefined;
+    if (!scheme || typeof scheme !== "object") continue;
+    const type = String(scheme.type ?? "").toLowerCase();
+
+    if (type === "oauth2") {
+      const flows = scheme.flows ?? {};
+      const flow = flows.authorizationCode;
+      if (!plan.oauth && flow && isHttpUrl(flow.authorizationUrl) && isHttpUrl(flow.tokenUrl)) {
+        const fromOps = operations.flatMap((o) => o.securityScopes[name] ?? []);
+        const scopes = [
+          ...new Set(fromOps.length > 0 ? fromOps : Object.keys(flow.scopes ?? {})),
+        ].sort();
+        if (scopes.length === 0) {
+          // connector-host rejects a manifest whose oauth.scopes is empty (the connector would
+          // deploy but fail to load at invoke time), so no oauth block is generated.
+          warnings.push(
+            `OAuth scheme "${name}" declares no scopes, so no oauth block was generated (connector-host requires at least one scope). ` +
+              `Add an oauth block with the scopes your operations need to connector.json to enable per-user connections.`
+          );
+        } else {
+          plan.oauth = {
+            authorizationUrl: flow.authorizationUrl,
+            tokenUrl: flow.tokenUrl,
+            scopes,
+          };
+        }
+      } else if (!flow) {
+        warnings.push(
+          `Security scheme "${name}": only the OAuth authorization-code flow maps to a NovaOS Class 3 connection; other flows are ignored.`
+        );
+      }
+    } else if (type === "http" && String(scheme.scheme ?? "").toLowerCase() === "bearer") {
+      plan.apiKey ??= { style: "bearer" };
+    } else if (type === "http" && String(scheme.scheme ?? "").toLowerCase() === "basic") {
+      plan.basic = true;
+    } else if (type === "apikey" && (scheme.in === "header" || scheme.in === "query")) {
+      if (typeof scheme.name === "string" && scheme.name) {
+        plan.apiKey ??= { style: scheme.in, name: scheme.name };
+      }
+    } else if (type) {
+      warnings.push(
+        `Security scheme "${name}" (${type}) has no NovaOS credential-class mapping and was ignored.`
+      );
+    }
+  }
+
+  // A bearer/API-key scheme is the simpler Class 2 credential, so it wins over Basic.
+  if (plan.apiKey) {
+    plan.basic = false;
+  }
+  if (!plan.oauth && !plan.apiKey && !plan.basic) {
+    plan.apiKey = { style: "bearer" };
+  }
+  return plan;
+}
+
+/** `my-api` → `MY_API`, the prefix of the Class 1a env var names. */
+function envPrefix(name: string): string {
+  return name
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+}
+
+export interface ConnectorPlan {
+  operations: ParsedOperation[];
+  skipped: SkippedOperation[];
+  auth: AuthPlan;
+  baseUrl: string;
+  /** Review items about the spec's servers (placeholder hosts, insecure URLs). */
+  warnings: string[];
+}
+
+/**
+ * The origin + path prefix generated code calls. Server variables are replaced
+ * by their defaults; the host of this URL is always covered by the SSRF
+ * allowlist because both are derived from the same `servers` list.
+ */
+export function resolveBaseUrl(servers: OpenApiServer[], warnings: string[] = []): string {
+  for (const server of servers) {
+    if (typeof server.url !== "string") continue;
+    let url = server.url.replace(/\{([^}]+)\}/g, (_m, key: string) => {
+      const v = server.variables?.[key]?.default;
+      return typeof v === "string" ? v : "";
+    });
+    if (!isHttpUrl(url)) continue;
+    // connector-host's SSRF gate only allows HTTPS (plain HTTP for localhost). Specs that
+    // list an http:// production server (SendGrid does) would fail every call.
+    const parsed = new URL(url);
+    if (parsed.protocol === "http:" && !isLocalHost(parsed.hostname)) {
+      url = `https://${url.slice("http://".length)}`;
+      warnings.push(
+        `Server "${server.url}" uses plain HTTP, which connector-host rejects; generated code uses HTTPS instead. Confirm the API serves HTTPS.`
+      );
+    }
+    return url.replace(/\/+$/, "");
+  }
+  return "";
+}
+
+function isLocalHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+/**
+ * Detect per-tenant server URLs such as `https://your-domain.atlassian.net` or
+ * `https://{subdomain}.zendesk.com`. The egress allowlist is an exact-host list
+ * checked again at publish time from the spec's `servers`, so a placeholder host
+ * would be baked in and every call would go to a host that does not exist.
+ */
+function placeholderServerWarning(servers: OpenApiServer[]): string | undefined {
+  const server = servers.find((s) => typeof s.url === "string");
+  if (!server) return undefined;
+  const afterScheme = server.url.replace(/^[a-z]+:\/\//i, "");
+  const host = afterScheme.split("/")[0] ?? "";
+  if (/\{[^}]+\}/.test(host) || /(^|[.-])(your|my)[-_]|<[^>]+>/i.test(host)) {
+    return (
+      `Server URL "${server.url}" looks tenant-specific. Replace it with the real base URL in the ` +
+      `spec's "servers" before generating (the SSRF allowlist is derived from it and re-checked at publish).`
+    );
+  }
+  return undefined;
+}
+
+export function planConnector(spec: OpenApiDocument, opts: ExtractOptions = {}): ConnectorPlan {
+  const { operations, skipped } = extractOperationsDetailed(spec, opts);
+  const warnings: string[] = [];
+  const placeholder = placeholderServerWarning(spec.servers ?? []);
+  if (placeholder) warnings.push(placeholder);
+  const baseUrl = resolveBaseUrl(spec.servers ?? [], warnings);
+  return {
+    operations,
+    skipped,
+    auth: analyzeAuth(spec, operations),
+    baseUrl,
+    warnings,
+  };
+}
+
+/**
+ * The description reaches the calling agent verbatim, so it carries the risk
+ * tag (the convention first-party connectors follow) and never ends up empty.
+ */
+function describeOperation(op: ParsedOperation): string {
+  const base =
+    (op.description ?? "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim() || `${op.method} ${op.path}`;
+  const note =
+    op.risk === "destructive" ? " Requires human-in-the-loop approval before executing." : "";
+  return `[${op.risk}] ${base}${note}`;
 }
 
 /**
@@ -378,15 +1025,17 @@ export function extractOperations(spec: OpenApiDocument): ParsedOperation[] {
  */
 export function openApiToConnectorManifest(
   spec: OpenApiDocument,
-  opts: { name: string; version: string; publisher?: string }
+  opts: { name: string; version: string; publisher?: string } & ExtractOptions,
+  plan: ConnectorPlan = planConnector(spec, opts)
 ): Record<string, unknown> {
   const servers = spec.servers ?? [];
   const declaredEgress = extractServerHostnames(servers);
 
   const operations: Record<string, ConnectorOperationDef> = {};
-  for (const op of extractOperations(spec)) {
+  for (const op of plan.operations) {
     const def: ConnectorOperationDef = {
-      description: op.description,
+      description: describeOperation(op),
+      risk: op.risk,
       requestSchema: op.requestSchema,
     };
     if (op.responseSchema) {
@@ -401,9 +1050,9 @@ export function openApiToConnectorManifest(
     version: opts.version,
     connector_type: "api",
     trust_tier: "standard",
-    data_license: "UNLICENSED",
+    data_license: "proprietary",
     sublicense_required: false,
-    data_tier: "information",
+    data_tier: "raw",
     declared_egress: declaredEgress,
     // air_gap_eligible is derived from declared_egress at validation time (T15)
     // — do NOT set it in the generator
@@ -413,6 +1062,57 @@ export function openApiToConnectorManifest(
     },
     operations,
   };
+
+  // Class 2: the host exposes each credentials_schema field as ctx.credentials[<name>].
+  // Optional when users can connect through OAuth (Class 3) instead.
+  const credentialFields: Array<Record<string, unknown>> = [];
+  if (plan.auth.apiKey) {
+    credentialFields.push({
+      name: "apiKey",
+      label: "API key",
+      type: "secret",
+      required: !plan.auth.oauth,
+      description:
+        plan.auth.apiKey.style === "bearer"
+          ? "Bearer token for the upstream API"
+          : `API key sent as the "${plan.auth.apiKey.name}" ${plan.auth.apiKey.style} parameter`,
+    });
+  }
+  if (plan.auth.basic) {
+    credentialFields.push(
+      {
+        name: "username",
+        label: "Username or account ID",
+        type: "string",
+        required: !plan.auth.oauth,
+        description: "Username (or account / client ID) for HTTP Basic authentication",
+      },
+      {
+        name: "password",
+        label: "Password or API token",
+        type: "secret",
+        required: !plan.auth.oauth,
+        description: "Password (or API token / auth token) for HTTP Basic authentication",
+      }
+    );
+  }
+  if (credentialFields.length > 0) {
+    manifest["credentials_schema"] = credentialFields;
+  }
+
+  if (plan.auth.oauth) {
+    // Class 3 (per-user OAuth). client_id_env / client_secret_env name the Class 1a
+    // platform env vars; their values are never part of the connector.
+    const prefix = envPrefix(opts.name);
+    manifest["oauth"] = {
+      authorization_url: plan.auth.oauth.authorizationUrl,
+      token_url: plan.auth.oauth.tokenUrl,
+      scopes: plan.auth.oauth.scopes,
+      client_id_env: `${prefix}_CLIENT_ID`,
+      client_secret_env: `${prefix}_CLIENT_SECRET`,
+      redirect_path: `/connect/${opts.name}/callback`,
+    };
+  }
 
   if (opts.publisher) {
     manifest["publisher"] = opts.publisher;
@@ -555,21 +1255,29 @@ export function revalidateSsrfAllowedDomainsAtPublish(
 // ---------------------------------------------------------------------------
 // Code generation
 // ---------------------------------------------------------------------------
+//
+// connector-host loads ONE compiled script per connector into a vm sandbox that
+// only allows require("zod" | "crypto" | "url"), then calls
+// `module.exports[operation](input, ctx)`. The generated package therefore
+// mirrors the hand-written connectors (packages/connectors/*): operations are
+// `(input, ctx)` functions, `src/connector.ts` assigns `module.exports`, and the
+// build bundles everything into `dist/connector.js` with esbuild.
 
 function generateConnectorPackageJson(name: string, version: string): string {
   const pkg = {
     name: `connector-${name}`,
     version,
-    type: "commonjs",
+    main: "dist/connector.js",
     scripts: {
-      build: "tsc",
-      start: "node dist/connector.js",
-    },
-    dependencies: {
-      "@novaos/connector-sdk": "workspace:*",
+      build:
+        "tsc --noEmit && esbuild src/connector.ts --bundle --platform=node --format=cjs --outfile=dist/connector.js --external:zod --external:crypto --external:url",
+      clean: "rm -rf dist",
+      "type-check": "tsc --noEmit",
     },
     devDependencies: {
-      typescript: "5.8.3",
+      "@types/node": "20.19.30",
+      esbuild: "0.27.3",
+      typescript: "5.9.3",
     },
   };
   return JSON.stringify(pkg, null, 2) + "\n";
@@ -578,120 +1286,306 @@ function generateConnectorPackageJson(name: string, version: string): string {
 function generateTsConfig(): string {
   const tsconfig = {
     compilerOptions: {
-      target: "CommonJS",
+      target: "ES2022",
       module: "CommonJS",
       moduleResolution: "node",
+      lib: ["ES2022"],
       strict: true,
+      esModuleInterop: true,
+      skipLibCheck: true,
       outDir: "dist",
       rootDir: "src",
-      declaration: true,
-      esModuleInterop: true,
     },
     include: ["src/**/*"],
+    exclude: ["node_modules", "dist", "**/*.test.ts"],
   };
   return JSON.stringify(tsconfig, null, 2) + "\n";
 }
 
-function generateOperationFile(op: ParsedOperation): string {
-  const hasInputProps =
-    op.requestSchema.properties && Object.keys(op.requestSchema.properties as object).length > 0;
-  const inputType = hasInputProps ? "Record<string, unknown>" : "Record<string, never>";
-
-  // Build the URL template line:
-  //   1. Start from op.path and substitute {param} placeholders using path params
-  //   2. Append query params via URLSearchParams when the method is GET/DELETE
-  let urlParts = op.path;
-  for (const p of op.pathParams) {
-    // Replace {paramName} with a template-literal substitution
-    urlParts = urlParts.replace(`{${p}}`, `\${String(input["${p}"] ?? "")}`);
-  }
-  // Emit the server base as a placeholder — connector-host injects the real origin
-  const urlExpr = `\`\${ctx.baseUrl ?? ""}${urlParts}\``;
-
-  // Query-string construction for GET / DELETE (body-less) operations
-  const queryBlock =
-    op.queryParams.length > 0 && (op.method === "GET" || op.method === "DELETE")
-      ? [
-          `  const _qs = new URLSearchParams();`,
-          ...op.queryParams.map(
-            (q) => `  if (input["${q}"] != null) _qs.set("${q}", String(input["${q}"]));`
-          ),
-          `  const _qstr = _qs.toString();`,
-          `  const _url = _qstr ? \`\${${urlExpr.slice(1, -1)}}?\${_qstr}\` : ${urlExpr};`,
-        ].join("\n")
-      : "";
-  const finalUrl = queryBlock ? "_url" : urlExpr;
-
-  // Body line: use input["body"] (the nested request body field) — NOT the whole input object
-  const bodyLine =
-    op.hasBody && op.method !== "GET" && op.method !== "DELETE"
-      ? `      body: JSON.stringify(input["body"] ?? {}),`
-      : "";
-
+function generateTypesTs(): string {
   return `${GENERATED_HEADER}
 ${GENERATED_BLOCK_START}
-import type { ConnectorContext } from "@novaos/connector-sdk";
-
 /**
- * ${op.description ?? op.slug} — ${op.method} ${op.path}
- *
- * Generated from operationId / path: ${op.slug}
+ * Minimal subset of the ConnectorContext (ctx) object injected by connector-host.
+ * Defined locally so the bundled connector has no runtime dependencies.
  */
-export async function ${op.camelName}(
-  ctx: ConnectorContext,
-  input: ${inputType}
-): Promise<unknown> {
-${queryBlock ? queryBlock + "\n" : ""}  const response = await ctx.fetch(
-    ${finalUrl},
-    {
-      method: "${op.method}",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: ctx.credentials.accessToken
-          ? \`Bearer \${ctx.credentials.accessToken}\`
-          : \`Bearer \${ctx.credentials.apiKey ?? ""}\`,
-      },
-${bodyLine ? bodyLine + "\n" : ""}    }
-  );
-  return response.json();
+export interface ConnectorCredentials {
+  /** Class 3 user OAuth token, or any bearer-style secret the host resolved. */
+  accessToken?: string;
+  /** Class 2 tenant key (credentials_schema field "apiKey") or Class 1b platform key. */
+  apiKey?: string;
+  refreshToken?: string;
+  [key: string]: string | undefined;
+}
+
+export interface ConnectorContext {
+  credentials: ConnectorCredentials;
+  /** SSRF-gated fetch — only allowed_domains pass through. */
+  fetch: (url: string, init?: RequestInit) => Promise<Response>;
+  tenantId: string;
+  traceId: string;
 }
 ${GENERATED_BLOCK_END}
 `;
 }
 
-function generateConnectorTs(name: string, version: string, operations: ParsedOperation[]): string {
-  const className = slugToPascalCase(name.replace(/[^a-z0-9]/gi, "-")) + "Connector";
+function generateHttpTs(): string {
+  return `${GENERATED_HEADER}
+${GENERATED_BLOCK_START}
+/** Set a query value; arrays repeat the key (OpenAPI form style, explode=true). */
+export function setQueryValue(params: URLSearchParams, key: string, value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (Array.isArray(value)) {
+    for (const item of value) params.append(key, String(item));
+    return;
+  }
+  params.set(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+}
 
-  const operationImports = operations
-    .map((op) => `import { ${op.camelName} } from "./operations/${op.slug}.js";`)
-    .join("\n");
+export function appendQuery(url: string, params: URLSearchParams): string {
+  const qs = params.toString();
+  if (!qs) return url;
+  return url + (url.includes("?") ? "&" : "?") + qs;
+}
 
-  const methodImpls = operations
-    .map(
-      (
-        op
-      ) => `  async ${op.camelName}(ctx: ConnectorContext, input: Record<string, unknown>): Promise<unknown> {
-    return ${op.camelName}(ctx, input);
-  }`
-    )
-    .join("\n\n");
+/** Encode an object as application/x-www-form-urlencoded. */
+export function toFormBody(value: unknown): URLSearchParams {
+  const form = new URLSearchParams();
+  if (typeof value === "object" && value !== null) {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      setQueryValue(form, k, v);
+    }
+  }
+  return form;
+}
+
+/** Throw on upstream HTTP errors; otherwise return parsed JSON (or text / null). */
+export async function readResponse(response: Response, label: string): Promise<unknown> {
+  if (!response.ok) {
+    throw new Error(\`\${label} upstream error \${response.status}: \${response.statusText}\`);
+  }
+  if (response.status === 204) return null;
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+${GENERATED_BLOCK_END}
+`;
+}
+
+const RESERVED_WORDS = new Set([
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "import",
+  "in",
+  "instanceof",
+  "new",
+  "null",
+  "return",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "var",
+  "void",
+  "while",
+  "with",
+  "yield",
+  "let",
+  "static",
+  "implements",
+  "interface",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "await",
+  "async",
+  "of",
+  "arguments",
+  "eval",
+]);
+
+/** Make a camelCase name safe as a function identifier. */
+function toIdentifier(camel: string): string {
+  const cleaned = camel.replace(/[^A-Za-z0-9_$]/g, "");
+  if (!cleaned || /^[0-9]/.test(cleaned) || RESERVED_WORDS.has(cleaned)) {
+    return `op${cleaned.charAt(0).toUpperCase()}${cleaned.slice(1)}`;
+  }
+  return cleaned;
+}
+
+/** Make spec-provided text safe inside a `/** ... *\/` block comment. */
+function commentSafe(text: string | undefined): string {
+  return (text ?? "").replace(/\s+/g, " ").replace(/\*\//g, "*\\/").trim().slice(0, 240);
+}
+
+/** `BASE_URL + "/items/" + encodeURIComponent(String(input["id"]))` — no raw spec text in code. */
+function urlExpression(urlPath: string): string {
+  const parts = urlPath.split(/\{([^}]+)\}/);
+  const segments: string[] = ["BASE_URL"];
+  parts.forEach((part, i) => {
+    if (i % 2 === 0) {
+      if (part) segments.push(JSON.stringify(part));
+    } else {
+      segments.push(`encodeURIComponent(String(input[${JSON.stringify(part)}]))`);
+    }
+  });
+  return segments.join(" + ");
+}
+
+function credentialBlock(auth: AuthPlan): string {
+  const lines: string[] = [
+    `  const accessToken = ctx.credentials.accessToken; // Class 3 (user OAuth) wins over Class 2`,
+  ];
+  const classes: string[] = [];
+  if (auth.oauth) classes.push("an OAuth access token (Class 3)");
+  if (auth.apiKey) classes.unshift("an API key (Class 2)");
+  if (auth.basic) classes.unshift("a username and password (Class 2)");
+  if (classes.length === 0) classes.push("an OAuth access token (Class 3)");
+  const message = `No credential available: requires ${classes.join(" or ")}`;
+
+  lines.push(`  if (accessToken) {`);
+  lines.push(`    headers["Authorization"] = \`Bearer \${accessToken}\`;`);
+  if (auth.apiKey) {
+    lines.push(`  } else if (ctx.credentials.apiKey) {`);
+    if (auth.apiKey.style === "bearer") {
+      lines.push(`    headers["Authorization"] = \`Bearer \${ctx.credentials.apiKey}\`;`);
+    } else if (auth.apiKey.style === "header") {
+      lines.push(`    headers[${JSON.stringify(auth.apiKey.name)}] = ctx.credentials.apiKey;`);
+    } else {
+      lines.push(`    query.set(${JSON.stringify(auth.apiKey.name)}, ctx.credentials.apiKey);`);
+    }
+  }
+  if (auth.basic) {
+    lines.push(`  } else if (ctx.credentials.username && ctx.credentials.password) {`);
+    lines.push(
+      `    const basic = Buffer.from(\`\${ctx.credentials.username}:\${ctx.credentials.password}\`).toString("base64");`
+    );
+    lines.push(`    headers["Authorization"] = \`Basic \${basic}\`;`);
+  }
+  lines.push(`  } else {`);
+  lines.push(`    throw new Error(${JSON.stringify(message)});`);
+  lines.push(`  }`);
+  return lines.join("\n");
+}
+
+function generateOperationFile(op: ParsedOperation, auth: AuthPlan, baseUrl: string): string {
+  const hasInputProps =
+    op.requestSchema.properties && Object.keys(op.requestSchema.properties as object).length > 0;
+  const inputType = hasInputProps ? "Record<string, unknown>" : "Record<string, never>";
+  const sendsBody = op.hasBody && op.method !== "GET" && op.method !== "DELETE";
+
+  const body: string[] = [];
+  for (const name of op.requiredParams) {
+    body.push(
+      `  if (input[${JSON.stringify(name)}] === undefined || input[${JSON.stringify(name)}] === null) {`,
+      `    throw new Error(${JSON.stringify(`${name} is required`)});`,
+      `  }`
+    );
+  }
+
+  body.push(`  const query = new URLSearchParams();`);
+  for (const q of op.queryParams) {
+    body.push(`  setQueryValue(query, ${JSON.stringify(q)}, input[${JSON.stringify(q)}]);`);
+  }
+
+  body.push(`  const headers: Record<string, string> = { Accept: "application/json" };`);
+  for (const h of op.headerParams) {
+    body.push(
+      `  if (input[${JSON.stringify(h)}] != null) headers[${JSON.stringify(h)}] = String(input[${JSON.stringify(h)}]);`
+    );
+  }
+  if (sendsBody) {
+    body.push(
+      `  headers["Content-Type"] = ${JSON.stringify(
+        op.bodyKind === "form" ? "application/x-www-form-urlencoded" : "application/json"
+      )};`
+    );
+  }
+  body.push(credentialBlock(auth));
+
+  const init: string[] = [`method: ${JSON.stringify(op.method)}`, `headers`];
+  if (sendsBody) {
+    init.push(
+      op.bodyKind === "form"
+        ? `body: toFormBody(input["body"]).toString()`
+        : `body: JSON.stringify(input["body"] ?? {})`
+    );
+  }
+  init.push(`signal: AbortSignal.timeout(30_000)`);
+
+  const imports = ["appendQuery", "readResponse"];
+  if (op.queryParams.length > 0) imports.push("setQueryValue");
+  if (sendsBody && op.bodyKind === "form") imports.push("toFormBody");
 
   return `${GENERATED_HEADER}
 ${GENERATED_BLOCK_START}
-import { DataSourceClient } from "@novaos/connector-sdk";
-import type { ConnectorContext } from "@novaos/connector-sdk";
+import { ${imports.sort().join(", ")} } from "../http";
+import type { ConnectorContext } from "../types";
 
-${operationImports}
+const BASE_URL = ${JSON.stringify(baseUrl)};
 
-export class ${className} extends DataSourceClient {
-  constructor() {
-    super({ name: ${JSON.stringify(name)}, version: ${JSON.stringify(version)} });
-  }
-
-${methodImpls}
+/**
+ * ${commentSafe(op.description) || op.slug} — ${op.method} ${commentSafe(op.path)}
+ *
+ * Generated from operationId / path: ${op.slug}
+ */
+export async function ${op.camelName}(
+  input: ${inputType},
+  ctx: ConnectorContext
+): Promise<unknown> {
+${body.join("\n")}
+  const response = await ctx.fetch(appendQuery(${urlExpression(op.path)}, query), {
+    ${init.join(",\n    ")},
+  });
+  return readResponse(response, ${JSON.stringify(op.slug)});
+}
+${GENERATED_BLOCK_END}
+`;
 }
 
-export default ${className};
+function generateConnectorTs(operations: ParsedOperation[]): string {
+  const imports = operations
+    .map((op) => `import { ${op.camelName} } from "./operations/${op.slug}";`)
+    .join("\n");
+  const entries = operations
+    .map((op) => `  ${JSON.stringify(op.slug)}: ${op.camelName},`)
+    .join("\n");
+
+  return `${GENERATED_HEADER}
+${GENERATED_BLOCK_START}
+${imports}
+
+// connector-host resolves the requested operation from module.exports and calls
+// it as (input, ctx). Keys must match the operation slugs in connector.json.
+module.exports = {
+${entries}
+};
 ${GENERATED_BLOCK_END}
 `;
 }
@@ -750,26 +1644,69 @@ function writeMergeSafe(filePath: string, content: string): "written" | "skipped
 // Main entry point
 // ---------------------------------------------------------------------------
 
-export interface OpenApiCodegenOptions {
+export interface OpenApiCodegenOptions extends ExtractOptions {
   name: string;
   publisher?: string;
   specPath: string;
   directory?: string;
 }
 
+export interface OpenApiCodegenResult {
+  directory: string;
+  files: string[];
+  /** Operations left out because the connector runtime cannot send their request body. */
+  skipped: SkippedOperation[];
+  /** Things a human should review before publishing (auth mapping, size, missing servers). */
+  warnings: string[];
+}
+
+/**
+ * Warn before a manifest approaches connector-host's publish request limit
+ * (10 MiB; older deployments still enforce Fastify's 1 MiB default).
+ */
+const MANIFEST_SIZE_WARNING_BYTES = 8_000_000;
+
+/**
+ * Spec licenses (for example CC BY 3.0 on Google's descriptions, MIT, Apache 2.0)
+ * can carry attribution duties that follow the generated package. Record them
+ * next to the code instead of dropping them. This is the license of the API
+ * description, not of the data the API returns.
+ */
+function generateNotice(info: OpenApiDocument["info"]): string | undefined {
+  const license = info.license;
+  if (!license?.name) return undefined;
+  const oneLine = (v: string): string => v.replace(/\s+/g, " ").trim();
+  const lines = [
+    "# Notice",
+    "",
+    `This connector was generated from the OpenAPI description "${oneLine(info.title)}" (version ${oneLine(info.version)}).`,
+    "",
+    `- Description license: ${oneLine(license.name)}${license.url ? ` (${oneLine(license.url)})` : ""}`,
+  ];
+  if (info.termsOfService) {
+    lines.push(`- API terms of service: ${oneLine(info.termsOfService)}`);
+  }
+  lines.push(
+    "",
+    "Any attribution or notice requirements of that license apply to this package. The license of the",
+    "API description does not grant rights to the data the API returns.",
+    ""
+  );
+  return lines.join("\n");
+}
+
+/** Above this many operations the connector is probably too broad to approve as one unit. */
+const LARGE_CONNECTOR_THRESHOLD = 150;
+
 /**
  * Generate a full connector package from an OpenAPI 3.x spec.
  *
- * Returns `{ directory, files }` in the same shape as `connectorInit`.
  * Throws if:
  *   - the spec file cannot be parsed
  *   - the spec is not OpenAPI 3.x
  *   - any server URL resolves to a forbidden SSRF target
  */
-export function initFromOpenApiSpec(opts: OpenApiCodegenOptions): {
-  directory: string;
-  files: string[];
-} {
+export function initFromOpenApiSpec(opts: OpenApiCodegenOptions): OpenApiCodegenResult {
   const { name, specPath } = opts;
 
   // Security: reject path traversal in the output directory
@@ -781,13 +1718,50 @@ export function initFromOpenApiSpec(opts: OpenApiCodegenOptions): {
   const spec = parseOpenApiSpec(specPath);
 
   const version = spec.info.version ?? "1.0.0";
-  const operations = extractOperations(spec);
+  const plan = planConnector(spec, {
+    includePaths: opts.includePaths,
+    includeRisks: opts.includeRisks,
+  });
+  const { operations } = plan;
+
+  const warnings = [...plan.auth.warnings, ...plan.warnings];
+  if (!plan.baseUrl) {
+    warnings.push(
+      'The spec has no absolute "servers" URL, so generated operations have no base URL to call.'
+    );
+  }
+  if (operations.length === 0) {
+    warnings.push(
+      "No operations were generated (check --include-path, --risk and the spec's paths)."
+    );
+  }
+  if (operations.length > LARGE_CONNECTOR_THRESHOLD) {
+    warnings.push(
+      `${operations.length} operations generated. Approval is per tool, so narrow the connector ` +
+        `with --include-path to the surface it needs.`
+    );
+  }
+  if (plan.skipped.length > 0) {
+    warnings.push(`${plan.skipped.length} operation(s) skipped (unsupported request body).`);
+  }
 
   // Build and validate the connector.json manifest (SSRF check at generation time)
-  const manifest = openApiToConnectorManifest(spec, { name, version, publisher: opts.publisher });
+  const manifest = openApiToConnectorManifest(
+    spec,
+    { name, version, publisher: opts.publisher },
+    plan
+  );
 
   // validateConnectorManifest throws on SSRF violations before any file is written
   validateConnectorManifest(manifest);
+
+  const manifestBytes = Buffer.byteLength(JSON.stringify(manifest));
+  if (manifestBytes > MANIFEST_SIZE_WARNING_BYTES) {
+    warnings.push(
+      `connector.json is ${Math.round(manifestBytes / 1024)} KB. Publish sends it as one JSON body, ` +
+        `and connector-host accepts up to 10 MiB. Narrow the connector with --include-path or --risk.`
+    );
+  }
 
   // Create directory structure
   mkdirSync(path.join(targetDir, "src", "operations"), { recursive: true });
@@ -802,33 +1776,29 @@ export function initFromOpenApiSpec(opts: OpenApiCodegenOptions): {
   );
   written.push(MANIFEST_FILENAME);
 
-  // tsconfig.json
-  const tsconfigPath = path.join(targetDir, "tsconfig.json");
-  if (writeMergeSafe(tsconfigPath, generateTsConfig()) === "written") {
-    written.push("tsconfig.json");
-  }
-
-  // package.json
-  const packageJsonPath = path.join(targetDir, "package.json");
-  if (writeMergeSafe(packageJsonPath, generateConnectorPackageJson(name, version)) === "written") {
-    written.push("package.json");
-  }
-
-  // src/connector.ts
-  const connectorTsPath = path.join(targetDir, "src", "connector.ts");
-  const connectorTsContent = generateConnectorTs(name, version, operations);
-  if (writeMergeSafe(connectorTsPath, connectorTsContent) === "written") {
-    written.push("src/connector.ts");
-  }
-
-  // src/operations/<slug>.ts
-  for (const op of operations) {
-    const opFilePath = path.join(targetDir, "src", "operations", `${op.slug}.ts`);
-    const opContent = generateOperationFile(op);
-    if (writeMergeSafe(opFilePath, opContent) === "written") {
-      written.push(`src/operations/${op.slug}.ts`);
+  const emit = (relPath: string, content: string): void => {
+    if (writeMergeSafe(path.join(targetDir, relPath), content) === "written") {
+      written.push(relPath);
     }
+  };
+
+  emit("tsconfig.json", generateTsConfig());
+  emit("package.json", generateConnectorPackageJson(name, version));
+  const notice = generateNotice(spec.info);
+  if (notice) {
+    emit("NOTICE.md", notice);
+  } else {
+    warnings.push(
+      "The spec declares no license (info.license). Confirm you may redistribute a connector derived from it."
+    );
+  }
+  emit("src/types.ts", generateTypesTs());
+  emit("src/http.ts", generateHttpTs());
+  emit("src/connector.ts", generateConnectorTs(operations));
+
+  for (const op of operations) {
+    emit(`src/operations/${op.slug}.ts`, generateOperationFile(op, plan.auth, plan.baseUrl));
   }
 
-  return { directory: rawDir, files: written };
+  return { directory: rawDir, files: written, skipped: plan.skipped, warnings };
 }

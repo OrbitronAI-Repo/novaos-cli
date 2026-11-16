@@ -17,9 +17,11 @@ import { Command } from "commander";
 import pkg from "../package.json";
 
 import { agentInit, type AgentLanguage } from "./agent-init.js";
+import { agentList, DEFAULT_AGENT_LIST_LIMIT } from "./agent-list.js";
 import { agentLogs, agentPodLogs } from "./agent-logs.js";
 import {
   getAccessToken,
+  hasStoredCredentials,
   login,
   logout,
   whoami,
@@ -62,6 +64,7 @@ import {
   getEnvironments,
   cliEnvToServiceEnvironment,
   describeUnknownEnvironment,
+  describeDerivedIamFailure,
 } from "./environments.js";
 import { evalLocal } from "./eval-local.js";
 import { evalRun, evalList } from "./eval.js";
@@ -75,12 +78,15 @@ import { migrateManifest } from "./migrate.js";
 import { publishStatus } from "./publish-status.js";
 import { agentPublish } from "./publish.js";
 import {
+  assertNotPlaceholderPublisher,
   createMarketplaceClientForEnv,
   fetchPublisherLookup,
   formatPublisherShowNoneMessage,
+  hasPlaceholderPublisher,
+  LOCAL_PLACEHOLDER_PUBLISHER,
+  PLACEHOLDER_PUBLISHER_MESSAGE,
   resolvePublisherSlugForInit,
 } from "./publisher.js";
-import { isPreCutoverIndex, PYTHON_SDK_PRE_CUTOVER_WARNING } from "./python-sdk-release.js";
 import { releaseCreate, releaseList } from "./release.js";
 import { sandboxStart, sandboxStop, sandboxStatus } from "./sandbox.js";
 import {
@@ -248,9 +254,17 @@ auth
     try {
       const urls = await getResolvedUrls();
       const opts = program.opts();
+      // Hint only when the IAM URL in use is the one derived from --api-base:
+      // not when a flag or NOVAOS_IAM_URL supplied it.
+      const envName = await getResolvedEnvName();
+      const preset = getEnvironment(envName);
+      const iamUrlIsDerived =
+        preset.iamUrlDerived === true &&
+        resolveUrlsWithProvenance(envName, { iamUrl: opts.iamUrl }).iamUrl.source === "preset";
       await login({
         iamUrl: opts.iamUrl || urls.iamUrl,
         clientId: opts.clientId || urls.clientId,
+        derivedIamHint: iamUrlIsDerived ? describeDerivedIamFailure(preset) : undefined,
       });
     } catch (error) {
       process.stderr.write(`Error: ${stringifyError(error)}\n`);
@@ -659,7 +673,8 @@ program
   .requiredOption("--name <name>", "Agent name (lowercase, DNS-compatible)")
   .option(
     "--publisher <publisher>",
-    "Publisher identity slug (default: JWT publisher_name, else Marketplace membership)"
+    "Publisher identity slug (default: JWT publisher_name, else Marketplace membership; " +
+      `on the local env when not logged in, the placeholder "${LOCAL_PLACEHOLDER_PUBLISHER}")`
   )
   .option("--lang <language>", "Language: typescript, python, or java", "typescript")
   .option(
@@ -672,9 +687,17 @@ program
   .action(async (opts) => {
     try {
       let publisher: string;
+      let usedPlaceholder = false;
       const explicitPublisher = opts.publisher as string | undefined;
       if (explicitPublisher) {
         publisher = explicitPublisher;
+      } else if ((await getResolvedEnvName()) === "local" && !(await hasStoredCredentials())) {
+        // Offline local start: on the local env with no stored login, whoami
+        // could only fail, so skip it and the lookup. The placeholder must be
+        // replaced before publishing (publish rejects it). A logged-in user
+        // keeps the JWT / Marketplace resolution below.
+        publisher = LOCAL_PLACEHOLDER_PUBLISHER;
+        usedPlaceholder = true;
       } else {
         const identity = await whoami();
         if (identity.publisher_name) {
@@ -705,6 +728,14 @@ program
         force: opts.force,
       });
 
+      if (usedPlaceholder) {
+        process.stderr.write(
+          `Note: local env, not logged in and no --publisher: manifest.json uses the placeholder ` +
+            `publisher "${LOCAL_PLACEHOLDER_PUBLISHER}". Publishing needs a real publisher: re-run init ` +
+            `with --publisher <slug> or set "publisher" in manifest.json (see \`novaos-cli publisher show\`).\n`
+        );
+      }
+
       process.stdout.write(`Agent project created at ${result.directory}\n`);
       process.stdout.write(`Language: ${result.language}\n`);
       if (result.protocol === "A2A") {
@@ -715,13 +746,6 @@ program
         process.stdout.write(`  ${file}\n`);
       }
 
-      // One-time heads-up (TestPyPI → production PyPI cutover gate): a
-      // scaffolded Python agent depends on novaos-agent-sdk, which currently
-      // has no production PyPI release.
-      if (result.language === "python" && isPreCutoverIndex()) {
-        process.stderr.write(PYTHON_SDK_PRE_CUTOVER_WARNING);
-      }
-
       process.stdout.write(`\nNext steps:\n`);
       process.stdout.write(`  cd ${result.directory}\n`);
       if (result.language === "typescript") {
@@ -730,7 +754,17 @@ program
       } else if (result.language === "python") {
         process.stdout.write(`  python3 -m venv .venv && source .venv/bin/activate\n`);
         process.stdout.write(`  pip install -r requirements.txt -r requirements-dev.txt\n`);
-        process.stdout.write(`  python server.py\n`);
+        process.stdout.write(`  novaos-cli test\n`);
+        process.stdout.write(`  novaos-cli run --input "..."\n`);
+        process.stdout.write(`  novaos-cli manifest validate manifest.json\n`);
+        if (usedPlaceholder) {
+          // Publishing needs a login and a real publisher in manifest.json.
+          process.stdout.write(`  novaos-cli auth login\n`);
+          process.stdout.write(
+            `  # set "publisher" in manifest.json (novaos-cli publisher show prints it)\n`
+          );
+        }
+        process.stdout.write(`  novaos-cli publish manifest.json --dry-run\n`);
       } else if (result.language === "java") {
         process.stdout.write(`  mvn spring-boot:run\n`);
       }
@@ -758,6 +792,7 @@ program
   .option("--json", "Machine-readable JSON output (suppresses progress)")
   .action(async (manifestPath: string, opts) => {
     try {
+      assertNotPlaceholderPublisher(manifestPath);
       await requireDeveloperRole();
       await agentPublish(await getAgentOpsClient(), {
         manifestPath,
@@ -779,19 +814,38 @@ program
   .description("Check review pipeline status for a submitted agent")
   .argument("<review-id>", "Review ID returned by novaos-cli publish")
   .option("--json", "Machine-readable JSON output")
+  .option("--wait", "Poll until the review is ACTIVE, REJECTED or ROLLED_BACK")
+  .option("--timeout <seconds>", "With --wait, give up after this many seconds (default 900)")
   .option(
     "--verify",
     "Fetch the served Agent Card at the printed agent id and fail if it does not resolve"
   )
+  .addHelpText(
+    "after",
+    `
+Exit codes:
+  0  status shown (or, with --wait, the version is ACTIVE)
+  1  REJECTED or ROLLED_BACK; --verify and the Agent Card does not resolve
+     (including HTTP 404); --wait timed out; or any other error`
+  )
   .action(async (reviewId: string, opts) => {
     try {
+      let timeoutSeconds: number | undefined;
+      if (opts.timeout !== undefined) {
+        timeoutSeconds = Number(opts.timeout);
+        if (!opts.wait || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+          throw new Error("--timeout needs --wait and a positive number of seconds");
+        }
+      }
       await requireDeveloperRole();
       const result = await publishStatus(await getAgentOpsClient(), reviewId, {
         json: opts.json,
         verify: opts.verify,
         gatewayClient: await getGatewayClient(),
+        wait: opts.wait,
+        timeoutSeconds,
       });
-      if (opts.verify && result.cardVerified === false) process.exit(1);
+      if (result.exitCode !== 0) process.exit(result.exitCode);
     } catch (error) {
       process.stderr.write(`Error: ${stringifyError(error)}\n`);
       process.exit(1);
@@ -953,6 +1007,9 @@ manifestCmd
         if (result.upgraded) {
           process.stdout.write("  Note: auto-upgraded from v1 to v2\n");
         }
+        if (hasPlaceholderPublisher(raw)) {
+          process.stderr.write(`  Warning: ${PLACEHOLDER_PUBLISHER_MESSAGE}\n`);
+        }
         if (result.warnings?.length) {
           for (const w of result.warnings) {
             process.stderr.write(`  Warning: ${w}\n`);
@@ -1087,15 +1144,23 @@ mcp
 
 mcp
   .command("invoke")
-  .description("Invoke an MCP tool via the sandbox gateway")
+  .description("Invoke an MCP tool on the local sandbox gateway (not a deployed environment)")
   .requiredOption("--tool <name>", "Qualified tool name (publisher.service.tool)")
   .option("--input <json>", "Tool arguments as JSON string", "{}")
   .option(
     "--mcp-gateway-url <url>",
-    "MCP Gateway URL (sandbox or deployed)",
+    "Sandbox MCP Gateway URL. Deployed gateways are not reachable from outside the cluster and accept only platform-issued execution tokens, which this command does not send",
     "http://localhost:4000"
   )
   .option("--json", "Output raw JSON response")
+  .addHelpText(
+    "after",
+    `
+Example (local sandbox):
+  novaos-cli mcp invoke --tool acme.hello.hello_world --input '{"key":"value"}'
+
+To exercise a tool on a deployed environment, run an agent or use Studio; the MCP gateway there is cluster-internal.`
+  )
   .action(async (opts) => {
     try {
       const { mcpInvoke } = await import("./mcp-invoke.js");
@@ -1234,9 +1299,45 @@ program
 const agent = program.command("agent").description("Agent management commands");
 
 agent
+  .command("list")
+  .description(
+    "List the agents of your publisher profile, with the agent ID the other commands need"
+  )
+  .option("--name <text>", "Only agents whose name contains this text")
+  .option("--limit <n>", "Maximum number of agents to show", String(DEFAULT_AGENT_LIST_LIMIT))
+  .option("--json", "Machine-readable JSON output")
+  .action(async (opts) => {
+    try {
+      await requireDeveloperRole();
+      const envName = await getResolvedEnvName();
+      let client;
+      try {
+        ({ client } = createMarketplaceClientForEnv(envName, program.opts().debug ?? false));
+      } catch {
+        throw new Error(
+          `agent list needs the Marketplace URL for environment "${envName}". ` +
+            `Set "marketplaceUrl" for it in ${getEnvironmentConfigPath()} or export NOVAOS_MARKETPLACE_URL.`
+        );
+      }
+      await agentList(client, {
+        name: opts.name,
+        limit: parseInt(opts.limit, 10),
+        json: opts.json,
+      });
+    } catch (error) {
+      process.stderr.write(`Error: ${stringifyError(error)}\n`);
+      process.exit(1);
+    }
+  });
+
+agent
   .command("logs")
   .description("Stream Loki-backed execution logs for a deployed agent")
-  .argument("<agent-id>", "Agent ID (UUID)")
+  .argument(
+    "<agent-id>",
+    "Agent ID (UUID) — run `novaos-cli agent list`, or see /developer/agents/<id> in the Marketplace. " +
+      "Not the installed instance ID from a chat page URL."
+  )
   .option("-f, --follow", "Follow log output (SSE streaming)")
   .option("--since <duration>", "Show logs since duration (e.g. 1h, 6h, 24h, 7d)", "1h")
   .option("--limit <n>", "Maximum number of log entries (default 200, max 1000)", "200")
@@ -1260,8 +1361,15 @@ agent
 
 agent
   .command("pod-logs")
-  .description("Fetch stdout/stderr from the agent's running Kubernetes pod")
-  .argument("<agent-id>", "Agent ID (UUID)")
+  .description(
+    "Fetch stdout/stderr from the agent's running Kubernetes pod " +
+      "(platform admins and members of the agent's publisher only; installers are rejected)"
+  )
+  .argument(
+    "<agent-id>",
+    "Agent ID (UUID) — run `novaos-cli agent list`, or see /developer/agents/<id> in the Marketplace. " +
+      "Not the installed instance ID from a chat page URL."
+  )
   .option("-f, --follow", "Follow pod log output (SSE streaming)")
   .option("--container <name>", 'Container name: "agent" or "auth-proxy"', "agent")
   .option("--tail-lines <n>", "Number of log lines to tail (1–10000)", "200")
@@ -1583,6 +1691,18 @@ connector
     "--spec <path>",
     "Path to an OpenAPI 3.x spec file (JSON or YAML) — generates a full connector package from it instead of the stub template"
   )
+  .option(
+    "--include-path <prefix>",
+    "With --spec: only generate operations whose path starts with <prefix> (repeatable, e.g. --include-path /me/messages). " +
+      "Narrow large specs to the surface the connector needs",
+    (value: string, previous: string[] = []) => [...previous, value]
+  )
+  .option(
+    "--risk <level>",
+    "With --spec: only generate operations of this risk class — read, write or destructive (repeatable). " +
+      "Use it to split one API into narrow connectors, for example a read-only one",
+    (value: string, previous: string[] = []) => [...previous, value]
+  )
   .action((opts) => {
     try {
       const result = connectorInit({
@@ -1591,11 +1711,19 @@ connector
         template: opts.template,
         directory: opts.dir,
         spec: opts.spec,
+        includePaths: opts.includePath,
+        includeRisks: opts.risk,
       });
       process.stdout.write(`Connector project created at ${result.directory}\n`);
       process.stdout.write(`Files:\n`);
       for (const file of result.files) {
         process.stdout.write(`  ${file}\n`);
+      }
+      for (const skipped of result.skipped ?? []) {
+        process.stderr.write(`Skipped ${skipped.method} ${skipped.path}: ${skipped.reason}\n`);
+      }
+      for (const warning of result.warnings ?? []) {
+        process.stderr.write(`Warning: ${warning}\n`);
       }
       process.stdout.write(`\nNext steps:\n`);
       process.stdout.write(`  cd ${result.directory}\n`);

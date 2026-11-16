@@ -1,44 +1,30 @@
 /**
- * Python agent SDK — TestPyPI → production PyPI cutover gate.
+ * Detects a Python agent whose requirements still install from TestPyPI.
  *
- * Python agents currently install `novaos-agent-sdk` from TestPyPI (see
- * PYTHON_AGENT_SDK_PACKAGE_INDEX_URL in ./constants.js), which has no
- * uptime/retention guarantee and can be purged without notice. This file
- * decides whether that pre-cutover index is still in effect, so callers
- * (`galaxy init`, `galaxy publish`) can surface it instead of silently
- * assuming TestPyPI is fine.
- *
- * The whole point of keying this off PYTHON_AGENT_SDK_PACKAGE_INDEX_URL is
- * that promoting the SDK to production PyPI is a single constant change in
- * ./constants.js — nothing here should need to change alongside it.
+ * New agents install `novaos-agent-sdk` from public PyPI. Agents scaffolded
+ * before the SDK was published there carry a `requirements-sdk.txt` that points
+ * at TestPyPI, which has no uptime or retention guarantee and can be purged
+ * without notice. `galaxy publish` uses this to warn about those agents, based
+ * on the agent's own files rather than anything about the CLI.
  */
-import { PYTHON_AGENT_SDK_PACKAGE_INDEX_URL } from "./constants.js";
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 
-/**
- * Hostname fragment identifying TestPyPI. A derived pattern, not a second
- * copy of the full TestPyPI URL, so PYTHON_AGENT_SDK_PACKAGE_INDEX_URL stays
- * the single source of truth and this can't drift out of sync with it.
- */
+/** Hostname that identifies TestPyPI. */
 const TEST_PYPI_HOSTNAME = "test.pypi.org";
 
-export interface PythonSdkCutoverStatus {
-  /** True while novaos-agent-sdk is still resolved from the pre-cutover TestPyPI index. */
-  preCutover: boolean;
-  /** The package index URL this status was computed from. */
-  indexUrl: string;
-}
+/** `--index-url`, `--extra-index-url` or `-i`, with a space or `=` before the URL. */
+const INDEX_DIRECTIVE = /^\s*(?:--index-url|--extra-index-url|-i)(?:\s+|=)(\S+)/;
 
 /**
- * Whether `indexUrl` (default: the currently configured
- * PYTHON_AGENT_SDK_PACKAGE_INDEX_URL) is still TestPyPI rather than
- * production PyPI.
+ * Whether `indexUrl` is TestPyPI (or a subdomain of it).
  *
  * Compares the parsed hostname, not a substring of the raw URL — a substring
  * check would treat something like "https://pypi.org/?x=test.pypi.org" as
  * TestPyPI, and "https://test.pypi.org.attacker.example/" as a legitimate
  * subdomain of it (CodeQL: incomplete URL substring sanitization).
  */
-export function isPreCutoverIndex(indexUrl: string = PYTHON_AGENT_SDK_PACKAGE_INDEX_URL): boolean {
+export function isTestPyPiIndex(indexUrl: string): boolean {
   let hostname: string;
   try {
     hostname = new URL(indexUrl).hostname.toLowerCase();
@@ -48,20 +34,36 @@ export function isPreCutoverIndex(indexUrl: string = PYTHON_AGENT_SDK_PACKAGE_IN
   return hostname === TEST_PYPI_HOSTNAME || hostname.endsWith(`.${TEST_PYPI_HOSTNAME}`);
 }
 
-/** Structured form of `isPreCutoverIndex`, for callers that want to report on it, not just branch on it. */
-export function pythonSdkCutoverStatus(
-  indexUrl: string = PYTHON_AGENT_SDK_PACKAGE_INDEX_URL
-): PythonSdkCutoverStatus {
-  return { preCutover: isPreCutoverIndex(indexUrl), indexUrl };
+/**
+ * Names of the `requirements*.txt` files directly in `dir` that point pip at
+ * TestPyPI. Returns an empty list when the directory cannot be read.
+ */
+export function testPyPiRequirementFiles(dir: string): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((name) => /^requirements.*\.txt$/.test(name));
+  } catch {
+    return [];
+  }
+  return names.filter((name) => {
+    let body: string;
+    try {
+      body = readFileSync(path.join(dir, name), "utf-8");
+    } catch {
+      return false;
+    }
+    return body.split("\n").some((line) => {
+      const match = INDEX_DIRECTIVE.exec(line);
+      return match !== null && isTestPyPiIndex(match[1]!);
+    });
+  });
 }
 
-/**
- * Prominent, single-line warning for a Python agent still pointed at the
- * pre-cutover index. Written to stderr by `galaxy init --lang python` (a
- * one-time heads-up at scaffold time) and `galaxy publish` (every time, since
- * the underlying condition can change between init and publish).
- */
-export const PYTHON_SDK_PRE_CUTOVER_WARNING =
-  "⚠ novaos-agent-sdk is installed from TestPyPI, which has no uptime or retention " +
-  "guarantee — this agent is not production-deployable until the SDK is promoted to " +
-  "production PyPI.\n";
+/** One-line warning naming the files that install from TestPyPI. */
+export function testPyPiWarning(files: string[]): string {
+  return (
+    `⚠ ${files.join(", ")} installs from TestPyPI, which has no uptime or retention ` +
+    "guarantee — this agent is not production-deployable. Install novaos-agent-sdk " +
+    'from PyPI instead (for example "novaos-agent-sdk>=2.1,<3" in requirements.txt).\n'
+  );
+}

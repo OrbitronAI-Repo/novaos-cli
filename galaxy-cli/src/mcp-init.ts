@@ -37,6 +37,7 @@ function generateManifest(opts: McpInitOptions): string {
       {
         name: "hello_world",
         description: "A sample tool that echoes its input",
+        capability: "read",
         parameters: {
           type: "object",
           properties: {
@@ -84,8 +85,16 @@ function generatePythonSource(name: string): string {
   return `"""${name} — MCP tool server."""
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 mcp = FastMCP("${name}")
+
+
+# The path the manifest's health_check and the Dockerfile HEALTHCHECK probe.
+@mcp.custom_route("${DEFAULT_HEALTH_PATH}", methods=["GET"])
+async def health(request: Request) -> PlainTextResponse:
+    return PlainTextResponse("ok")
 
 
 @mcp.tool()

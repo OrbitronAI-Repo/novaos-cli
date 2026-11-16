@@ -5,6 +5,8 @@
  * publisher_name. CLI discovers it via GET /api/developer/publisher (Bearer).
  */
 
+import { readFileSync } from "node:fs";
+
 import { getErrorMessage } from "@novaos-cli/shared/utils";
 import { z } from "zod";
 
@@ -17,6 +19,43 @@ import {
 } from "./http-client.js";
 
 export const PUBLISHER_SLUG_PATTERN = /^[a-z][a-z0-9-]{0,62}$/;
+
+/**
+ * Publisher slug `init` writes when it runs offline on the local env (not
+ * logged in, no --publisher). It is never a real publisher, so publish
+ * rejects it before contacting any server.
+ */
+export const LOCAL_PLACEHOLDER_PUBLISHER = "local-publisher";
+
+export const PLACEHOLDER_PUBLISHER_MESSAGE =
+  `manifest.json uses the placeholder publisher "${LOCAL_PLACEHOLDER_PUBLISHER}" from an offline \`init\`. ` +
+  `Set "publisher" in manifest.json to your publisher slug (\`novaos-cli publisher show\` prints it) before publishing.`;
+
+/** Whether a parsed manifest still carries the offline-init placeholder publisher. */
+export function hasPlaceholderPublisher(manifest: unknown): boolean {
+  return (
+    typeof manifest === "object" &&
+    manifest !== null &&
+    (manifest as { publisher?: unknown }).publisher === LOCAL_PLACEHOLDER_PUBLISHER
+  );
+}
+
+/**
+ * Fail fast, before auth or any network call, when the manifest at `manifestPath`
+ * still has the placeholder publisher. An unreadable or invalid manifest is left
+ * for the publish flow to report.
+ */
+export function assertNotPlaceholderPublisher(manifestPath: string): void {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  } catch {
+    return;
+  }
+  if (hasPlaceholderPublisher(manifest)) {
+    throw new Error(PLACEHOLDER_PUBLISHER_MESSAGE);
+  }
+}
 
 export interface PublisherProfileSummary {
   id: string;

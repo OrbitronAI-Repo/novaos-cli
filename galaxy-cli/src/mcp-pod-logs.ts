@@ -10,7 +10,7 @@ import { z } from "zod";
 
 import { getAccessToken, getIdToken } from "./auth.js";
 import { USER_AGENT, REQUEST_TIMEOUT_MS } from "./constants.js";
-import { withRequestId, type GalaxyHttpClient } from "./http-client.js";
+import { problemMessage, withRequestId, type GalaxyHttpClient } from "./http-client.js";
 
 const PodLogLineSchema = z.object({
   timestamp: z.string().nullable(),
@@ -95,13 +95,9 @@ export async function mcpPodLogs(
   } else {
     const response = await client.request<Record<string, unknown>>(path);
     if (!response.ok) {
-      const errorData = response.data as {
-        errors?: { detail?: string; title?: string }[] | null;
-      };
-      const err0 = errorData.errors?.[0];
       throw new Error(
         withRequestId(
-          err0?.detail ?? err0?.title ?? `Failed to fetch MCP pod logs (HTTP ${response.status})`,
+          `${problemMessage(response.data) ?? "Failed to fetch MCP pod logs"} (HTTP ${response.status})`,
           response
         )
       );

@@ -35,3 +35,18 @@ export * from "./user-context-extension.js";
  * makes the same decision.
  */
 export * from "./memory-budget.js";
+
+/**
+ * The resolved in-run check configuration the platform attaches to a run, and the
+ * rule that sets each rubric's bar.
+ */
+export * from "./check-config.js";
+
+/**
+ * Builds the run's `in_run_check` from an agent's pinned check declaration and a
+ * rubric source.
+ */
+export * from "./check-config-resolver.js";
+
+/** Reads an agent's pinned check declaration from its raw catalog manifest. */
+export * from "./check-declaration.js";

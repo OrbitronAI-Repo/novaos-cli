@@ -18,9 +18,8 @@ import {
   JAVA_AGENT_SDK_ARTIFACT_ID,
   JAVA_AGENT_SDK_GROUP_ID,
   JAVA_AGENT_SDK_VERSION,
-  PYTHON_AGENT_SDK_PACKAGE_INDEX_URL,
   PYTHON_AGENT_SDK_PYPI_PACKAGE,
-  PYTHON_AGENT_SDK_VERSION,
+  PYTHON_AGENT_SDK_VERSION_SPEC,
   TS_AGENT_SDK_NPM_PACKAGE,
   TS_AGENT_SDK_VERSION_RANGE,
 } from "./constants.js";
@@ -122,7 +121,7 @@ function buildManifest(opts: AgentInitOptions, protocol: NewAgentProtocol): stri
       {
         name: "greet",
         description: "Greet a user by name",
-        // ACP plaintext: Agent.handleAcpRequest passes a string into skill.input.parse
+        // The SDK passes the message text to the skill as a plain string
         input_schema: { type: "string" },
         output_schema: {
           type: "object",
@@ -199,8 +198,7 @@ export function createAgentInitModule(deps: AgentInitDeps = {}) {
       author_name: opts.publisher,
       author_email: "developer@example.com",
       python_sdk_package: PYTHON_AGENT_SDK_PYPI_PACKAGE,
-      python_sdk_version: PYTHON_AGENT_SDK_VERSION,
-      python_sdk_index_url: PYTHON_AGENT_SDK_PACKAGE_INDEX_URL,
+      python_sdk_version_spec: PYTHON_AGENT_SDK_VERSION_SPEC,
       ts_sdk_package: TS_AGENT_SDK_NPM_PACKAGE,
       ts_sdk_version_range: TS_AGENT_SDK_VERSION_RANGE,
       java_sdk_group_id: JAVA_AGENT_SDK_GROUP_ID,

@@ -3,7 +3,9 @@
  *
  * Wraps fetch with automatic Bearer token injection, request tracing,
  * transparent 401 retry with token refresh, and configurable retry/backoff
- * on transient failures (see RetryConfig).
+ * on transient failures (see RetryConfig). A Retry-After on a retryable
+ * response is honoured up to MAX_RETRY_AFTER_S; a longer one ends the retry
+ * loop at once.
  *
  * fetch, the token functions, retry config, and the retry delay itself are
  * all injectable (see GalaxyHttpClientDeps) so tests can construct a real
@@ -24,6 +26,7 @@ import {
 import {
   USER_AGENT,
   MAX_AUTH_RETRIES,
+  MAX_RETRY_AFTER_S,
   REQUEST_TIMEOUT_MS,
   RETRY_BASE_DELAY_MS,
   RETRY_MAX_DELAY_MS,
@@ -45,6 +48,8 @@ export interface ApiResponse<T = unknown> {
   data: T;
   /** The X-Request-ID sent on this request — surface it in error messages so users can hand it to support. */
   requestId: string;
+  /** The response's Retry-After as a delay in ms, when it sent a parseable one. */
+  retryAfterMs?: number;
 }
 
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
@@ -84,6 +89,23 @@ export interface GalaxyHttpClientDeps {
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Parses a Retry-After header (delay-seconds or an HTTP date, RFC 9110
+ * §10.2.3) into a delay in ms. Returns undefined when absent or unparseable,
+ * so the caller falls back to its own backoff.
+ */
+export function parseRetryAfterMs(
+  value: string | null,
+  now: number = Date.now()
+): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, at - now);
 }
 
 /** Full-jitter exponential backoff, capped, per attempt (1-indexed). */
@@ -178,11 +200,13 @@ export class GalaxyHttpClient {
 
     let currentToken = token;
     let lastError: unknown;
+    let retryAfterMs: number | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (attempt > 1) {
-        await this.sleepImpl(backoffDelayMs(attempt - 1));
+        await this.sleepImpl(Math.max(backoffDelayMs(attempt - 1), retryAfterMs ?? 0));
       }
+      retryAfterMs = undefined;
 
       try {
         let result = await this.executeRequest<T>(
@@ -207,7 +231,20 @@ export class GalaxyHttpClient {
         }
 
         if (attempt < maxAttempts && RETRYABLE_STATUS_CODES.has(result.status)) {
-          continue;
+          // A Retry-After beyond the cap means the next attempt would fail the
+          // same way: return this response (and its reason) now instead.
+          if (
+            result.retryAfterMs === undefined ||
+            result.retryAfterMs <= MAX_RETRY_AFTER_S * 1000
+          ) {
+            retryAfterMs = result.retryAfterMs;
+            continue;
+          }
+          if (this.debug) {
+            this.debugLog(
+              `[debug] not retrying ${method} ${path}: Retry-After ${Math.ceil(result.retryAfterMs / 1000)}s exceeds ${MAX_RETRY_AFTER_S}s`
+            );
+          }
         }
 
         this.recordOutcome(result.ok);
@@ -277,12 +314,14 @@ export class GalaxyHttpClient {
       }
 
       const data = (await response.json().catch(() => ({}))) as T;
+      const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
 
       return {
         ok: response.ok,
         status: response.status,
         data,
         requestId,
+        ...(retryAfterMs !== undefined && { retryAfterMs }),
       };
     } catch (error) {
       if (this.debug) {
@@ -341,6 +380,22 @@ export function extractErrorDetail(data: unknown): string {
   if (typeof obj.error === "string") return withErrorHint(obj.error, obj.error);
 
   return JSON.stringify(data);
+}
+
+/**
+ * The human-readable reason in an error body, or undefined when it has none
+ * so the caller can fall back to a status-only message. Checks, in order:
+ * a flat problem+json `detail`, the API envelope's `errors[0].detail`, then
+ * the legacy `message` and string `error` fields.
+ */
+export function problemMessage(body: unknown): string | undefined {
+  if (typeof body !== "object" || body === null) return undefined;
+  const obj = body as Record<string, unknown>;
+  const first = Array.isArray(obj.errors) ? (obj.errors[0] as Record<string, unknown>) : undefined;
+  for (const candidate of [obj.detail, first?.detail, obj.message, obj.error]) {
+    if (typeof candidate === "string" && candidate.length > 0) return candidate;
+  }
+  return undefined;
 }
 
 /** Error codes whose fix is a CLI command the user can run. */

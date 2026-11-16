@@ -19,7 +19,24 @@ import { z } from "zod";
 
 import { getAccessToken, getIdToken } from "./auth.js";
 import { USER_AGENT, REQUEST_TIMEOUT_MS } from "./constants.js";
-import { extractErrorDetail, withRequestId, type GalaxyHttpClient } from "./http-client.js";
+import {
+  extractErrorDetail,
+  problemMessage,
+  withRequestId,
+  type GalaxyHttpClient,
+} from "./http-client.js";
+
+/**
+ * Appended to a 404 from the per-agent routes. The id in a chat page URL is an
+ * installed-instance id, which looks the same as an agent id but is not one.
+ */
+const AGENT_ID_HINT =
+  " These commands take the agent ID, not an installed instance ID (the id in a chat page URL). " +
+  "Run `novaos-cli agent list` to find it.";
+
+function withAgentIdHint(message: string, status: number): string {
+  return status === 404 ? message + AGENT_ID_HINT : message;
+}
 
 interface AgentLogsOptions {
   follow?: boolean;
@@ -158,10 +175,12 @@ export async function agentLogs(
   } else {
     const response = await client.request<Record<string, unknown>>(path);
     if (!response.ok) {
-      const errorData = response.data as { error?: string; message?: string };
       throw new Error(
         withRequestId(
-          errorData.message ?? `Failed to fetch logs (HTTP ${response.status})`,
+          withAgentIdHint(
+            `${problemMessage(response.data) ?? "Failed to fetch logs"} (HTTP ${response.status})`,
+            response.status
+          ),
           response
         )
       );
@@ -250,8 +269,12 @@ async function streamOnce(client: GalaxyHttpClient, path: string, json: boolean)
   });
 
   if (!response.ok) {
+    const reason = problemMessage(await response.json().catch(() => undefined));
     throw new NonRetryableError(
-      `Failed to connect to log stream (HTTP ${response.status}) (request ID: ${requestId})`
+      withAgentIdHint(
+        `${reason ?? "Failed to connect to log stream"} (HTTP ${response.status}) (request ID: ${requestId})`,
+        response.status
+      )
     );
   }
 
@@ -428,7 +451,11 @@ export async function agentPodLogs(
     if (!response.ok) {
       throw new Error(
         withRequestId(
-          extractErrorDetail(response.data) || `Failed to fetch pod logs (HTTP ${response.status})`,
+          withAgentIdHint(
+            extractErrorDetail(response.data) ||
+              `Failed to fetch pod logs (HTTP ${response.status})`,
+            response.status
+          ),
           response
         )
       );
@@ -507,7 +534,10 @@ async function streamPodLogsOnce(
 
   if (!response.ok) {
     throw new NonRetryableError(
-      `Failed to connect to pod log stream (HTTP ${response.status}) (request ID: ${requestId})`
+      withAgentIdHint(
+        `Failed to connect to pod log stream (HTTP ${response.status}) (request ID: ${requestId})`,
+        response.status
+      )
     );
   }
 

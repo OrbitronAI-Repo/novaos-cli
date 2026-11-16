@@ -14,6 +14,7 @@ import {
   PLATFORM_MAX_MEMORY_MB,
   PLATFORM_MAX_CPU_MILLICORES,
 } from "./constants.js";
+import { BRIDGE_REFUSAL_MESSAGES, checkProgressBridge } from "./progress-bridge.js";
 
 // ---- Zod Schema (runtime validation) ----
 
@@ -48,6 +49,14 @@ export const PERMISSION_TOOL_VALUES = [
   "connectors",
 ] as const;
 
+// Tool categories that can change state outside the run. An agent granted any
+// of them should declare `resumable: true`, meaning it saves and resumes through
+// the SDK save-and-resume interface, so a retried or resumed task does not
+// repeat a write. Publish warns when the declaration is missing; it does not block.
+export const WRITE_PERMISSION_TOOLS: ReadonlySet<(typeof PERMISSION_TOOL_VALUES)[number]> = new Set(
+  ["memory", "files", "notify", "http", "browser", "code", "agents", "connectors"]
+);
+
 const PermissionsSchema = z
   .object({
     tools: z.array(z.enum(PERMISSION_TOOL_VALUES)).optional(),
@@ -81,6 +90,60 @@ const ShadowSchema = z
   .object({
     evaluation: ShadowEvaluationSchema,
   })
+  .optional();
+
+/**
+ * The in-run check an agent declares: which judge, which rubrics and what bar. A rubric is a
+ * built-in (`builtin`) or a published one pinned to a version (`ref`). `file` is accepted by the
+ * shape only so it can be refused with a reason: custom rubric files are not available yet.
+ * Unknown settings are errors, so a misspelt setting cannot be silently dropped.
+ */
+export const CUSTOM_RUBRIC_FILE_UNAVAILABLE =
+  "custom rubric files are not available yet; use a built-in or a published rubric reference";
+
+const InRunCheckRubricSchema = z
+  .object({
+    builtin: z
+      .string()
+      .regex(/^[a-z0-9_]+$/)
+      .optional(),
+    ref: z
+      .string()
+      .regex(/^[a-z0-9_-]+\/[a-z0-9_]+@[1-9][0-9]*$/, "must be publisher/name@version")
+      .optional(),
+    file: z.string().min(1).optional(),
+    threshold: z.number().min(0).optional(),
+  })
+  .strict()
+  .superRefine((rubric, ctx) => {
+    if (rubric.file !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["file"],
+        message: CUSTOM_RUBRIC_FILE_UNAVAILABLE,
+      });
+      return;
+    }
+    const named = [rubric.builtin, rubric.ref].filter((v) => v !== undefined).length;
+    if (named !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "a rubric names exactly one of builtin or ref",
+      });
+    }
+  });
+
+const InRunCheckSchema = z
+  .object({
+    judge_model: z.string().min(1),
+    threshold: z.number().min(0).optional(),
+    max_refinements: z.number().int().min(0).optional(),
+    budget_ms: z.number().int().positive().optional(),
+    deterministic: z.array(z.string().min(1)).optional(),
+    regulated_outputs: z.array(z.string().min(1)).optional(),
+    rubrics: z.array(InRunCheckRubricSchema).min(1),
+  })
+  .strict()
   .optional();
 
 const AuthorSchema = z
@@ -257,6 +320,19 @@ export const AgentManifestV2Schema = z.object({
   // v2 permissions (NEW)
   permissions: PermissionsSchema,
 
+  // Declares that the agent saves and resumes through the SDK save-and-resume
+  // interface. Expected whenever permissions.tools grants a write tool.
+  resumable: z.boolean().optional(),
+
+  // The in-run check the agent runs on its own output, declared once and resolved by the
+  // platform at publish.
+  in_run_check: InRunCheckSchema,
+
+  // How the platform drives an agent that starts a job with one skill and polls it with
+  // another. Kept as written so it reaches the server; the whole block is checked by
+  // `checkProgressBridge` in validateManifest (see progress-bridge.ts).
+  progress_bridge: z.unknown().optional(),
+
   // Inherited (short form — quick author ergonomics)
   requiredSecrets: z.array(z.string()).optional(),
   requiredConfig: z.array(z.string()).optional(),
@@ -346,6 +422,23 @@ export function upgradeV1toV2(manifest: Record<string, unknown>): Record<string,
 
 // ---- Validation ----
 
+/**
+ * Warning for an agent that is granted write tools but does not declare
+ * `resumable: true`, or undefined when there is nothing to warn about.
+ */
+export function resumableWriteWarning(manifest: AgentManifestV2): string | undefined {
+  if (manifest.resumable === true) return undefined;
+  const writeTools = (manifest.permissions?.tools ?? []).filter((t) =>
+    WRITE_PERMISSION_TOOLS.has(t)
+  );
+  if (writeTools.length === 0) return undefined;
+  return (
+    `permissions.tools grants write tools (${writeTools.join(", ")}) but the manifest does not set ` +
+    `"resumable": true. A retried or resumed task may repeat its writes. Use the SDK ` +
+    `save-and-resume interface and set "resumable": true.`
+  );
+}
+
 export interface ManifestValidationResult {
   valid: boolean;
   manifest?: AgentManifestV2;
@@ -357,7 +450,10 @@ export interface ManifestValidationResult {
 /**
  * Validate an agent manifest. Auto-upgrades v1 manifests to v2 before validation.
  */
-export function validateManifest(raw: unknown): ManifestValidationResult {
+export function validateManifest(
+  raw: unknown,
+  options: { now?: Date } = {}
+): ManifestValidationResult {
   if (typeof raw !== "object" || raw === null) {
     return {
       valid: false,
@@ -389,6 +485,18 @@ export function validateManifest(raw: unknown): ManifestValidationResult {
     };
   }
 
+  const bridgeRefusals = checkProgressBridge(manifest, options.now ?? new Date());
+  if (bridgeRefusals.length > 0) {
+    return {
+      valid: false,
+      errors: bridgeRefusals.map((r) => ({
+        path: r.path,
+        message: BRIDGE_REFUSAL_MESSAGES[r.code],
+      })),
+      upgraded,
+    };
+  }
+
   const warnings: string[] = [];
 
   if (result.data.base_image) {
@@ -411,6 +519,9 @@ export function validateManifest(raw: unknown): ManifestValidationResult {
       );
     }
   }
+
+  const resumableWarning = resumableWriteWarning(result.data);
+  if (resumableWarning) warnings.push(resumableWarning);
 
   const perms = result.data.permissions;
   if (perms?.max_memory_mb && perms.max_memory_mb > PLATFORM_MAX_MEMORY_MB) {
